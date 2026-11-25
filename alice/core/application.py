@@ -128,10 +128,48 @@ Only call tools when the user explicitly requests a computer action. For normal 
             arguments_str = func.get("arguments", "{}")
             call_id = call.get("id", "call_1")
 
-            try:
-                arguments = json.loads(arguments_str)
-            except json.JSONDecodeError:
+            # LM Studio may return function arguments as either a JSON string
+            # (OpenAI-compatible wire format) or an already-decoded dictionary.
+            # Never pass a dict to json.loads(), and never silently execute a
+            # malformed/non-object argument payload with empty arguments.
+            if isinstance(arguments_str, dict):
+                arguments = arguments_str
+            elif isinstance(arguments_str, str):
+                try:
+                    arguments = json.loads(arguments_str or "{}")
+                except json.JSONDecodeError as exc:
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps({
+                            "status": "error",
+                            "error": f"Invalid JSON arguments for {tool_name}: {exc}"
+                        })
+                    })
+                    continue
+            elif arguments_str is None:
                 arguments = {}
+            else:
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps({
+                        "status": "error",
+                        "error": f"Unsupported argument type for {tool_name}: {type(arguments_str).__name__}"
+                    })
+                })
+                continue
+
+            if not isinstance(arguments, dict):
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps({
+                        "status": "error",
+                        "error": f"Arguments for {tool_name} must be a JSON object, got {type(arguments).__name__}"
+                    })
+                })
+                continue
 
             # Check permissions
             tool = self.tool_registry.get(tool_name)
