@@ -285,7 +285,8 @@ Only call tools when the user explicitly requests a computer action. For normal 
         )
 
         # Add results to history and get final response
-        messages = [{"role": "system", "content": self.system_prompt}] + history + [
+        # history already contains the system prompt at index 0, so use it directly
+        messages = history + [
             {"role": "assistant", "content": f"Executed plan: {plan_summary}\nResults:\n{results_summary}"}
         ]
 
@@ -796,7 +797,8 @@ Only call tools when the user explicitly requests a computer action. For normal 
             # Use empty string for content when only tool_calls are present
             assistant_message = {"role": "assistant", "content": "", "tool_calls": formatted_tool_calls}
 
-        messages = [{"role": "system", "content": self.system_prompt}] + history + [
+        # history already contains the system prompt at index 0, so use it directly
+        messages = history + [
             assistant_message
         ] + tool_results
 

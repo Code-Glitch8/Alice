@@ -397,5 +397,125 @@ class TestIntegrationScenarios(unittest.TestCase):
         pass  # Covered in other tests
 
 
+class TestSystemPromptDuplication(unittest.TestCase):
+    """Regression test: System prompt must appear exactly once at index 0.
+
+    This test verifies the fix for the Jinja Exception: System message must be at
+    the beginning error that occurred when the system prompt was being duplicated
+    in the tool execution loop.
+    """
+
+    def setUp(self):
+        self.mock_config = MagicMock()
+        self.mock_config.ai.base_url = "http://127.0.0.1:1234"
+        self.mock_config.automation.auto_confirm_category_a = True
+        self.mock_config.automation.require_confirm_category_b = False
+        self.mock_config.automation.restricted_category_c = False
+        self.mock_config.automation.max_tool_calls = 5
+
+    def test_system_prompt_appears_once_after_tool_execution(self):
+        """Test that system prompt is at index 0 and appears only once after tool calls."""
+        with patch.object(LMStudioAdapter, '_request', return_value={}):
+            app = AliceApplication(self.mock_config)
+
+        # Track messages sent to LM Studio
+        messages_sent_to_runtime = []
+
+        async def mock_chat(messages, **kwargs):
+            messages_sent_to_runtime.append([dict(m) for m in messages])
+            # First call: return tool calls
+            # Second call: return final response
+            call_count = len(messages_sent_to_runtime)
+            if call_count == 1:
+                return json.dumps({
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {
+                            "name": "open_app", "arguments": '{"app_name": "notepad"}'
+                        }}
+                    ],
+                    "has_tool_calls": True
+                })
+            else:
+                return "Task completed successfully"
+
+        app.runtime.chat = mock_chat
+
+        # Execute the chat with tools
+        result = asyncio.run(app.chat_with_tools([{"role": "user", "content": "Open notepad"}]))
+
+        # Verify we captured messages from two calls
+        self.assertEqual(len(messages_sent_to_runtime), 2, "Should have made 2 calls to LM Studio")
+
+        # Check the SECOND call (after tool execution) for system prompt placement
+        second_call_messages = messages_sent_to_runtime[1]
+
+        # Count system messages
+        system_messages = [m for m in second_call_messages if m.get("role") == "system"]
+        self.assertEqual(len(system_messages), 1, "Should have exactly one system message")
+
+        # Verify system message is at index 0
+        self.assertEqual(second_call_messages[0]["role"], "system", "System message must be at index 0")
+
+        # Verify system message has proper content
+        self.assertIn("ALICE", second_call_messages[0]["content"])
+
+        # Verify assistant tool call message is present
+        assistant_messages = [m for m in second_call_messages if m.get("role") == "assistant"]
+        self.assertEqual(len(assistant_messages), 1, "Should have one assistant message")
+
+        # Verify tool results are present
+        tool_messages = [m for m in second_call_messages if m.get("role") == "tool"]
+        self.assertGreater(len(tool_messages), 0, "Should have tool result messages")
+
+    def test_multiple_consecutive_tool_calls_no_system_duplication(self):
+        """Test that system prompt doesn't duplicate after multiple rounds of tool calls."""
+        with patch.object(LMStudioAdapter, '_request', return_value={}):
+            app = AliceApplication(self.mock_config)
+
+        messages_sent_to_runtime = []
+        call_count = [0]
+
+        async def mock_chat(messages, **kwargs):
+            messages_sent_to_runtime.append([dict(m) for m in messages])
+            call_count[0] += 1
+
+            if call_count[0] == 1:
+                # First call: returns tool call
+                return json.dumps({
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {
+                            "name": "open_app", "arguments": '{"app_name": "notepad"}'
+                        }}
+                    ],
+                    "has_tool_calls": True
+                })
+            elif call_count[0] == 2:
+                # Second call: returns another tool call
+                return json.dumps({
+                    "content": "Now type some text",
+                    "tool_calls": [
+                        {"id": "call_2", "type": "function", "function": {
+                            "name": "type_text", "arguments": '{"text": "Hello"}'
+                        }}
+                    ],
+                    "has_tool_calls": True
+                })
+            else:
+                # Third call: returns final response
+                return "All tasks completed"
+
+        app.runtime.chat = mock_chat
+
+        # Execute
+        result = asyncio.run(app.chat_with_tools([{"role": "user", "content": "Open notepad and type Hello"}]))
+
+        # Check all calls for system prompt duplication
+        for i, messages in enumerate(messages_sent_to_runtime):
+            system_messages = [m for m in messages if m.get("role") == "system"]
+            self.assertEqual(len(system_messages), 1,
+                f"Call {i+1}: Should have exactly one system message, found {len(system_messages)}")
+            self.assertEqual(messages[0]["role"], "system", f"Call {i+1}: System message must be at index 0")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
