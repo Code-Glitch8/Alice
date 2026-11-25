@@ -108,7 +108,11 @@ Only call tools when the user explicitly requests a computer action. For normal 
         try:
             parsed = json.loads(response)
             if "tool_calls" in parsed:
-                return await self._execute_tool_calls(parsed["tool_calls"], history)
+                # Extract content from the AI response (may be None/empty when only tool_calls)
+                content = parsed.get("content")
+                if content is None:
+                    content = ""
+                return await self._execute_tool_calls(parsed["tool_calls"], history, content)
         except json.JSONDecodeError:
             # Not a tool call, return as-is
             return response
@@ -155,7 +159,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         return normalized
 
-    async def _execute_tool_calls(self, tool_calls: List[Dict], history: List[Dict[str, str]]) -> str:
+    async def _execute_tool_calls(self, tool_calls: List[Dict], history: List[Dict[str, str]], assistant_content: str = "") -> str:
         """Execute tool calls and return results to LLM for final response."""
         tool_results = []
 
@@ -238,8 +242,33 @@ Only call tools when the user explicitly requests a computer action. For normal 
             })
 
         # Send tool results back to LLM for final response
+        # Use OpenAI-compatible format: tool_calls at message level, not inside content
+        # Ensure arguments are properly formatted as JSON strings for the API
+        formatted_tool_calls = []
+        for tc in tool_calls:
+            formatted_call = {
+                "id": tc.get("id"),
+                "type": tc.get("type"),
+                "function": {
+                    "name": tc.get("function", {}).get("name"),
+                    "arguments": tc.get("function", {}).get("arguments", {})
+                }
+            }
+            # Ensure arguments are a JSON string (OpenAI format)
+            if isinstance(formatted_call["function"]["arguments"], dict):
+                formatted_call["function"]["arguments"] = json.dumps(formatted_call["function"]["arguments"])
+            formatted_tool_calls.append(formatted_call)
+
+        if assistant_content:
+            # Assistant has both content and tool calls
+            assistant_message = {"role": "assistant", "content": assistant_content, "tool_calls": formatted_tool_calls}
+        else:
+            # Assistant only has tool calls (no text content)
+            # Use empty string for content when only tool_calls are present
+            assistant_message = {"role": "assistant", "content": "", "tool_calls": formatted_tool_calls}
+
         messages = [{"role": "system", "content": self.system_prompt}] + history + [
-            {"role": "assistant", "content": json.dumps({"tool_calls": tool_calls})}
+            assistant_message
         ] + tool_results
 
         final_response = await self.runtime.chat(messages)
