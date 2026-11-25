@@ -95,6 +95,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         Uses native tool calling when tools are provided to LM Studio.
         Falls back to parsing AI response if tool calls are returned as text/JSON.
+        Integrates the task planner for compound commands.
         """
         if not self.initialized and not await self.initialize():
             raise RuntimeError(self.ai_adapter.last_error or "LM Studio is unavailable")
@@ -117,16 +118,116 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 content = parsed.get("content")
                 if content is None:
                     content = ""
-                return await self._execute_tool_calls(parsed["tool_calls"], history, content)
+
+                tool_calls = parsed["tool_calls"]
+
+                # Detect if this is a compound command that should use the planner
+                if self._is_compound_command(content, tool_calls):
+                    # Use planner for compound commands
+                    return await self._execute_planned_tasks(history, content, tool_calls)
+
+                return await self._execute_tool_calls(tool_calls, history, content)
 
         return response
 
+    def _is_compound_command(self, content: str, tool_calls: List[Dict]) -> bool:
+        """Detect if this is a compound command that needs planning.
+
+        Compound commands contain multiple actions like "open X and do Y" or
+        sequential operations that need proper ordering.
+        """
+        # Check tool call count - multiple calls may indicate compound command
+        if len(tool_calls) > 1:
+            return True
+
+        # Check content for compound command patterns
+        if content:
+            content_lower = content.lower()
+            compound_patterns = [
+                "and ", " then ", " after ", " followed by ",
+                " open ",
+                " type ",
+                " create ",
+                " download ",
+            ]
+            if any(pattern in content_lower for pattern in compound_patterns):
+                # Single tool call with compound intent - planner may help
+                return True
+
+        return False
+
+    async def _execute_planned_tasks(self, history: List[Dict[str, str]], content: str, tool_calls: List[Dict]) -> str:
+        """Execute compound commands using the task planner."""
+        # Build a combined user message from history
+        user_messages = [h for h in history if h.get("role") == "user"]
+        latest_user = user_messages[-1]["content"] if user_messages else content
+
+        # Plan the task
+        steps = self.task_planner.plan(latest_user)
+
+        # Check permissions and execute steps sequentially
+        results = []
+        for step in steps:
+            tool = self.tool_registry.get(step.tool_name)
+            if tool:
+                # Check if step requires confirmation
+                if not self._check_permission(tool):
+                    step.requires_confirmation = True
+                    results.append({
+                        "step_id": step.step_id,
+                        "description": step.description,
+                        "tool": step.tool_name,
+                        "requires_confirmation": True,
+                        "message": f"Step requires user confirmation (category {tool.required_permission})"
+                    })
+                    # Continue with unconfirmed steps for now, or return early
+                    # For now, we'll skip unconfirmed tool calls
+                    continue
+
+            success = step.execute(self.tool_registry)
+            if success:
+                # Verify step result
+                if step.result:
+                    if isinstance(step.result, dict):
+                        step.verified = step.result.get("status") == "success"
+                    else:
+                        step.verified = bool(step.result)
+            else:
+                step.verified = False
+
+            results.append({
+                "step_id": step.step_id,
+                "description": step.description,
+                "tool": step.tool_name,
+                "result": step.result,
+                "verified": step.verified,
+                "error": step.error,
+                "requires_confirmation": False
+            })
+
+        # Build response for final LLM call
+        plan_summary = self.task_planner.get_plan_summary()
+        results_summary = "\n".join(
+            f"- Step {r['step_id']}: {r['description']} - {r['result'] if isinstance(r['result'], dict) else r['result']}"
+            for r in results
+        )
+
+        # Add results to history and get final response
+        messages = [{"role": "system", "content": self.system_prompt}] + history + [
+            {"role": "assistant", "content": f"Executed plan: {plan_summary}\nResults:\n{results_summary}"}
+        ]
+
+        final_response = await self.runtime.chat(messages)
+        return final_response
+
     def _parse_ai_response(self, response: str) -> Optional[Dict[str, Any]]:
-        """Parse AI response, handling both raw JSON and markdown-fenced JSON.
+        """Parse AI response, handling multiple formats.
 
         AI may return:
         - Raw JSON: {"tool_calls": [...], "content": "..."}
         - Markdown-fenced: ```json\n{"tool_calls": [...]}\n```
+        - XML-style (Qwen): <function=type_name>\n<parameter>name</parameter>\n</function>
+        - has_tool_calls format from LM Studio
 
         Also handles the new format from LM Studio with has_tool_calls flag.
         """
@@ -134,6 +235,14 @@ Only call tools when the user explicitly requests a computer action. For normal 
             return None
 
         response = response.strip()
+
+        # Check for XML-style tool calls first (Qwen format)
+        xml_tool_calls = self._parse_xml_tool_calls(response)
+        if xml_tool_calls:
+            return {
+                "tool_calls": xml_tool_calls,
+                "content": ""
+            }
 
         # Try markdown-fenced JSON first
         if "```json" in response or "```" in response:
@@ -159,6 +268,109 @@ Only call tools when the user explicitly requests a computer action. For normal 
             return parsed
         except json.JSONDecodeError:
             return None
+
+    def _parse_xml_tool_calls(self, response: str) -> List[Dict[str, Any]]:
+        """Parse XML-style tool calls from Qwen model.
+
+        Qwen may return tool calls in XML format:
+        <function=type_text>
+        <parameter>text</parameter>
+        </function>
+
+        Or with name attribute:
+        <function=name="open_app"><parameter name="app_name">notepad</parameter></function>
+
+        Returns list of tool call dicts or empty list if not XML format.
+        """
+        tool_calls = []
+
+        # Match XML tool call patterns
+        # Pattern 1: <function=function_name> or <function=name="function_name">
+        # Pattern 2: Content with <parameter> elements
+
+        # First, try to match <function=name="..."> format (attribute style)
+        attr_pattern = r'<function[^>]*name=["\']([^"\']+)["\'][^>]*>(.*?)</function>'
+        attr_matches = list(re.finditer(attr_pattern, response, re.DOTALL | re.IGNORECASE))
+
+        for match in attr_matches:
+            func_name = match.group(1)
+            inner_content = match.group(2)
+            args = self._parse_xml_parameters(inner_content, func_name)
+            tool_calls.append({
+                "id": f"call_{len(tool_calls) + 1}",
+                "type": "function",
+                "function": {
+                    "name": func_name,
+                    "arguments": json.dumps(args, ensure_ascii=False) if args else "{}"
+                }
+            })
+
+        # Second, try to match <function=function_name> format (direct assignment)
+        direct_pattern = r'<function=(\w+)>(.*?)</function>'
+        direct_matches = list(re.finditer(direct_pattern, response, re.DOTALL))
+
+        for match in direct_matches:
+            func_name = match.group(1)
+            inner_content = match.group(2)
+            args = self._parse_xml_parameters(inner_content, func_name)
+            # Avoid duplicates if a tool was already matched by attribute pattern
+            if not any(tc["function"]["name"] == func_name for tc in tool_calls):
+                tool_calls.append({
+                    "id": f"call_{len(tool_calls) + 1}",
+                    "type": "function",
+                    "function": {
+                        "name": func_name,
+                        "arguments": json.dumps(args, ensure_ascii=False) if args else "{}"
+                    }
+                })
+
+        return tool_calls
+
+    def _parse_xml_parameters(self, inner_content: str, func_name: str) -> Dict[str, Any]:
+        """Parse parameters from XML function call inner content."""
+        args = {}
+
+        # Parse <parameter> elements
+        # Handle both <parameter>value</parameter> and <parameter name="key">value</parameter>
+        param_pattern = r'<parameter[^>]*>(.*?)</parameter>'
+        param_matches = list(re.finditer(param_pattern, inner_content, re.DOTALL))
+
+        if not param_matches:
+            return args
+
+        for i, pm in enumerate(param_matches):
+            param_value = pm.group(1).strip()
+
+            # Check for name attribute on parameter element
+            name_match = re.search(r'name=["\']([^"\']+)["\']', pm.group(0))
+            if name_match:
+                # Named parameter: <parameter name="text">hello</parameter>
+                param_name = name_match.group(1)
+                args[param_name] = param_value
+            else:
+                # For simple tools with single param or positional args
+                # Use parameter index as key for single-arg tools
+                if i == 0:
+                    # Check if this tool has a known single parameter
+                    single_param_map = {
+                        "type_text": "text",
+                        "keyboard_shortcut": "keys",
+                        "mouse_move": None,  # needs x and y
+                        "set_clipboard": "content",
+                        "get_clipboard": None,
+                        "open_app": "app_name",
+                        "close_app": "app_name",
+                        "focus_app": "app_name",
+                    }
+                    if single_param_map.get(func_name):
+                        args[single_param_map[func_name]] = param_value
+                    else:
+                        # Use generic key
+                        args[f"arg{i + 1}"] = param_value
+                else:
+                    args[f"arg{i + 1}"] = param_value
+
+        return args
 
     def get_tools_for_api(self) -> List[Dict[str, Any]]:
         """Generate OpenAI-compatible tool definitions from the tool registry.
@@ -189,28 +401,28 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     "app_name": {"type": "string", "description": "Name of the application to open"},
                     "target_path": {"type": "string", "description": "Optional target path or URL", "default": None}
                 }
-                tool_def["function"]["required"] = ["app_name"]
+                tool_def["function"]["parameters"]["required"] = ["app_name"]
             elif tool.name == "close_app":
                 tool_def["function"]["parameters"]["properties"] = {
                     "app_name": {"type": "string", "description": "Name of the application to close"}
                 }
-                tool_def["function"]["required"] = ["app_name"]
+                tool_def["function"]["parameters"]["required"] = ["app_name"]
             elif tool.name == "focus_app":
                 tool_def["function"]["parameters"]["properties"] = {
                     "app_name": {"type": "string", "description": "Name of the application to focus"}
                 }
-                tool_def["function"]["required"] = ["app_name"]
+                tool_def["function"]["parameters"]["required"] = ["app_name"]
             elif tool.name == "create_folder":
                 tool_def["function"]["parameters"]["properties"] = {
                     "path": {"type": "string", "description": "Path of the folder to create"}
                 }
-                tool_def["function"]["required"] = ["path"]
+                tool_def["function"]["parameters"]["required"] = ["path"]
             elif tool.name == "search_files":
                 tool_def["function"]["parameters"]["properties"] = {
                     "query": {"type": "string", "description": "Search query"},
                     "folder": {"type": "string", "description": "Folder to search in (optional)", "default": None}
                 }
-                tool_def["function"]["required"] = ["query"]
+                tool_def["function"]["parameters"]["required"] = ["query"]
             elif tool.name == "browser_open":
                 tool_def["function"]["parameters"]["properties"] = {
                     "url": {"type": "string", "description": "URL to open", "default": None},
@@ -223,13 +435,13 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     "selector": {"type": "string", "description": "CSS selector (optional)", "default": None},
                     "visible": {"type": "boolean", "description": "Whether to open browser visibly", "default": False}
                 }
-                tool_def["function"]["required"] = ["url"]
+                tool_def["function"]["parameters"]["required"] = ["url"]
             elif tool.name == "browser_download":
                 tool_def["function"]["parameters"]["properties"] = {
                     "url": {"type": "string", "description": "URL of file to download"},
                     "destination": {"type": "string", "description": "Destination path (optional)", "default": None}
                 }
-                tool_def["function"]["required"] = ["url"]
+                tool_def["function"]["parameters"]["required"] = ["url"]
             elif tool.name == "browser_screenshot":
                 tool_def["function"]["parameters"]["properties"] = {
                     "url": {"type": "string", "description": "URL to screenshot"},
@@ -237,26 +449,27 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     "destination": {"type": "string", "description": "Destination path (optional)", "default": None},
                     "visible": {"type": "boolean", "description": "Whether to open browser visibly", "default": False}
                 }
-                tool_def["function"]["required"] = ["url"]
+                tool_def["function"]["parameters"]["required"] = ["url"]
             elif tool.name == "type_text":
                 tool_def["function"]["parameters"]["properties"] = {
                     "text": {"type": "string", "description": "Text to type"},
                     "delay": {"type": "number", "description": "Delay between keystrokes", "default": 0},
-                    "interval": {"type": "number", "description": "Typing interval", "default": 0}
+                    "interval": {"type": "number", "description": "Typing interval", "default": 0},
+                    "target_window": {"type": "string", "description": "Target window title to type into (optional)", "default": None}
                 }
-                tool_def["function"]["required"] = ["text"]
+                tool_def["function"]["parameters"]["required"] = ["text"]
             elif tool.name == "keyboard_shortcut":
                 tool_def["function"]["parameters"]["properties"] = {
                     "keys": {"type": "string", "description": "Keys to press (e.g., 'ctrl+c', 'alt+tab')"}
                 }
-                tool_def["function"]["required"] = ["keys"]
+                tool_def["function"]["parameters"]["required"] = ["keys"]
             elif tool.name == "mouse_move":
                 tool_def["function"]["parameters"]["properties"] = {
                     "x": {"type": "number", "description": "X coordinate"},
                     "y": {"type": "number", "description": "Y coordinate"},
                     "duration": {"type": "number", "description": "Duration in seconds", "default": 0}
                 }
-                tool_def["function"]["required"] = ["x", "y"]
+                tool_def["function"]["parameters"]["required"] = ["x", "y"]
             elif tool.name == "mouse_click":
                 tool_def["function"]["parameters"]["properties"] = {
                     "x": {"type": "number", "description": "X coordinate (optional)", "default": None},
@@ -270,7 +483,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     "x": {"type": "number", "description": "X coordinate (optional)", "default": None},
                     "y": {"type": "number", "description": "Y coordinate (optional)", "default": None}
                 }
-                tool_def["function"]["required"] = ["clicks"]
+                tool_def["function"]["parameters"]["required"] = ["clicks"]
             elif tool.name == "select_text":
                 tool_def["function"]["parameters"]["properties"] = {
                     "method": {"type": "string", "description": "Selection method ('all', 'word', 'line', 'paragraph')", "default": "all"}
@@ -279,14 +492,14 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 tool_def["function"]["parameters"]["properties"] = {
                     "action": {"type": "string", "description": "Action ('copy', 'cut', 'paste')"}
                 }
-                tool_def["function"]["required"] = ["action"]
+                tool_def["function"]["parameters"]["required"] = ["action"]
             elif tool.name == "get_clipboard":
                 tool_def["function"]["parameters"]["properties"] = {}
             elif tool.name == "set_clipboard":
                 tool_def["function"]["parameters"]["properties"] = {
                     "content": {"type": "string", "description": "Content to set to clipboard"}
                 }
-                tool_def["function"]["required"] = ["content"]
+                tool_def["function"]["parameters"]["required"] = ["content"]
             elif tool.name == "system_info":
                 tool_def["function"]["parameters"]["properties"] = {}
             elif tool.name == "list_running_apps":
@@ -295,7 +508,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 tool_def["function"]["parameters"]["properties"] = {
                     "app_name": {"type": "string", "description": "Name of the application"}
                 }
-                tool_def["function"]["required"] = ["app_name"]
+                tool_def["function"]["parameters"]["required"] = ["app_name"]
             elif tool.name == "close_all_apps":
                 tool_def["function"]["parameters"]["properties"] = {}
             elif tool.name == "get_open_apps":
@@ -318,7 +531,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
         # Parameter name aliases (AI-generated -> tool signature)
         # These map common alternative names to the actual parameter names
         param_aliases = {
-            "open_app": {"app": "app_name"},
+            "open_app": {"app": "app_name", "target": "target_path"},
             "close_app": {"app": "app_name"},
             "focus_app": {"app": "app_name"},
             "browser_open": {"url": "url", "search": "search"},
@@ -328,7 +541,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
             "mouse_move": {"x": "x", "y": "y", "duration": "duration"},
             "mouse_click": {"x": "x", "y": "y", "button": "button", "clicks": "clicks"},
             "mouse_scroll": {"clicks": "clicks", "x": "x", "y": "y"},
-            "type_text": {"text": "text", "delay": "delay"},
+            "type_text": {"text": "text", "delay": "delay", "target_window": "target_window", "window": "target_window"},
             "keyboard_shortcut": {"keys": "keys"},
             "search_files": {"query": "query", "folder": "folder"},
             "create_folder": {"path": "path"},
@@ -422,7 +635,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
             # Execute tool through dispatcher (handles async tools properly)
             if tool:
-                result = self.tool_dispatcher.execute(tool_name, arguments)
+                result = await self.tool_dispatcher.execute_async(tool_name, arguments)
             else:
                 result = {"status": "error", "error": f"Tool {tool_name} not found"}
 
@@ -466,15 +679,26 @@ Only call tools when the user explicitly requests a computer action. For normal 
         return final_response
 
     def _check_permission(self, tool) -> bool:
-        """Check if tool execution is permitted based on automation config."""
+        """Check if tool execution is permitted based on automation config.
+
+        Returns True if the tool is allowed to execute.
+        Category A: auto_confirm_category_a = True allows execution
+        Category B: require_confirm_category_b = False allows execution (auto-confirm off = auto-confirm on)
+        Category C: restricted_category_c = False allows execution (restricted = blocked by default)
+        """
         perm = tool.required_permission
 
         if perm == "A":
+            # Category A tools: auto-confirm enabled means allowed
             return self.automation_config.auto_confirm_category_a
         elif perm == "B":
-            return not self.automation_config.require_confirm_category_b  # True means requires confirmation
+            # Category B tools: require_confirm_category_b = False means auto-confirm ON (allowed)
+            # require_confirm_category_b = True means user must confirm (not auto-allowed)
+            return not self.automation_config.require_confirm_category_b
         elif perm == "C":
-            return not self.automation_config.restricted_category_c  # True means restricted
+            # Category C tools: restricted_category_c = False means NOT restricted (allowed)
+            # restricted_category_c = True means restricted/blocked
+            return not self.automation_config.restricted_category_c
         return True
 
     async def execute_intent(self, user_intent: str) -> Dict[str, Any]:

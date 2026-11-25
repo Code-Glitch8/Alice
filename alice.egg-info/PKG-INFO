@@ -1,0 +1,244 @@
+Metadata-Version: 2.4
+Name: alice
+Version: 0.1.0
+Summary: Autonomous Local Intelligence & Computer Engine - A local voice-controlled Windows AI assistant
+Home-page: https://github.com/yourusername/alice
+Author: ALICE Team
+Author-email: alice@example.com
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: End Users/Desktop
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: Microsoft :: Windows :: Windows 11
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Desktop Environment
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: PySide6>=6.7.0
+Requires-Dist: pydantic>=2.7.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: faster-whisper>=1.0.0
+Requires-Dist: piper-tts>=1.0.0
+Requires-Dist: openwakeword>=0.3.0
+Requires-Dist: sounddevice>=0.4.6
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: psutil>=5.9.0
+Requires-Dist: pywinauto>=0.6.8
+Requires-Dist: wmi>=1.5.1
+Requires-Dist: pywin32>=306
+Requires-Dist: keyboard>=0.13.5
+Requires-Dist: pyautogui>=0.9.54
+Requires-Dist: pyperclip>=1.8.2
+Requires-Dist: playwright>=1.40.0
+Requires-Dist: rich>=13.7.0
+Requires-Dist: click>=8.1.0
+Requires-Dist: toml>=0.10.2
+Requires-Dist: aiohttp>=3.9.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: tqdm>=4.66.0
+Requires-Dist: pytest>=8.0.0
+Requires-Dist: pytest-asyncio>=0.23.0
+Requires-Dist: black>=24.0.0
+Requires-Dist: ruff>=0.4.0
+Requires-Dist: mypy>=1.9.0
+Requires-Dist: pyinstaller>=6.3.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# ALICE — Local Windows AI Assistant
+
+ALICE is a local-first Windows assistant that can control your computer using natural language. It integrates with LM Studio for local LLM inference and provides real Windows automation capabilities.
+
+## Current Phase 2 Status (✅ Complete)
+
+**Phase 1 - LM Studio Integration:**
+- Real LM Studio server connectivity through `http://127.0.0.1:1234`
+- Installed-model discovery through `GET /api/v1/models`
+- Model loading and unloading through LM Studio's REST API
+- Chat and streamed text responses through `/v1/chat/completions`
+- Async runtime manager with idle unloading
+
+**Phase 2 - Windows Automation & Tool System:**
+- ✅ Real Windows application control (open, close, focus apps via aliases, PATH, registry)
+- ✅ Real keyboard/mouse automation (pyautogui, pywinauto)
+- ✅ File operations (search, create, rename, copy, move, extract ZIP)
+- ✅ Browser automation with Playwright (open, search, extract, download, screenshot)
+- ✅ ToolRegistry with 20+ registered tools returning verified results
+- ✅ TaskPlanner breaking down natural language into executable steps
+- ✅ LM Studio tool-calling integration (preserves tool_calls in responses)
+- ✅ Natural language intent detection (chat vs commands)
+- ✅ Permission system (Category A: auto, B: confirmation, C: restricted)
+- ✅ Emergency stop mechanism (mouse to corner)
+- ✅ Comprehensive testing infrastructure
+
+## Requirements
+
+- Windows 11 recommended.
+- Python 3.11 or newer.
+- LM Studio installed.
+- Qwen 3.5 4B GGUF already downloaded in LM Studio.
+- Playwright browsers: `playwright install chromium` (run once after pip install)
+
+Install Python dependencies from the repository root:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+playwright install chromium
+```
+
+## Start the LM Studio server
+
+The model being downloaded does not automatically start the API server.
+
+1. Open LM Studio.
+2. Press `Ctrl + 2` to open the Developer tab.
+3. Find the local server status control and turn **Start server** on.
+4. Keep the address bound to `127.0.0.1` / localhost and use port `1234` unless you deliberately changed it.
+5. Leave the model unloaded if you want ALICE to load it on demand.
+
+LM Studio's official docs also describe starting the server with `lms server start`. If the `lms` command is installed and on PATH, ALICE can attempt to start the server automatically. Otherwise, start it from the Developer tab as above.
+
+## Configure the model
+
+The default model selector is `qwen3.5-4b`. ALICE queries LM Studio for installed model keys and tries to match that label. LM Studio's model key is authoritative and may differ from the display name.
+
+If automatic selection is ambiguous, create `D:\Alice\config\config.json` (or `%ALICE_HOME%\config\config.json`) and set `ai.model_name` to the exact `key` returned by LM Studio's model list endpoint.
+
+Example:
+
+```json
+{
+  "ai": {
+    "runtime": "lmstudio",
+    "model_name": "qwen3.5-4b",
+    "base_url": "http://127.0.0.1:1234",
+    "auto_start_server": true,
+    "startup_timeout": 30,
+    "request_timeout": 180,
+    "context_length": 4096,
+    "idle_timeout": 300,
+    "auto_load": false,
+    "temperature": 0.7,
+    "max_tokens": 1024
+  },
+  "automation": {
+    "auto_confirm_category_a": true,
+    "require_confirm_category_b": true,
+    "restricted_category_c": true,
+    "emergency_stop_enabled": true,
+    "allowed_locations": [
+      "C:\\Users\\USERNAME\\Desktop",
+      "C:\\Users\\USERNAME\\Documents",
+      "C:\\Users\\USERNAME\\Downloads"
+    ]
+  }
+}
+```
+
+## Available Tools
+
+**Application Control (Category A):**
+- `open_app` - Open applications (notepad, chrome, calculator, etc.)
+- `close_app` - Close applications
+- `focus_app` - Focus application window
+- `list_running_apps` - List running processes
+
+**File Operations (Category A):**
+- `create_folder` - Create directories
+- `search_files` - Search for files by name/extension
+
+**Browser Automation (Category A/B):**
+- `browser_open` - Open browser or search web
+- `browser_extract` - Extract text from web page
+- `browser_download` - Download files (Category B)
+- `browser_screenshot` - Take screenshots
+
+**Keyboard/Mouse Automation (Category A):**
+- `type_text` - Type text into active window
+- `keyboard_shortcut` - Execute shortcuts (ctrl+c, alt+tab, win+d)
+- `mouse_move` - Move mouse to coordinates
+- `mouse_click` - Click mouse
+- `mouse_scroll` - Scroll wheel
+- `select_text` - Select text (all, word, line, paragraph)
+- `copy_paste` - Copy, cut, paste
+- `get_clipboard` / `set_clipboard` - Clipboard operations
+
+**System (Category A):**
+- `system_info` - Get CPU/RAM info
+- `emergency_stop` - Emergency stop (moves mouse to corner)
+
+## Verify the connection
+
+From the repository root (the directory containing the `alice` package):
+
+```powershell
+python -m alice.cli --check-ai
+```
+
+This checks the local server and lists installed LLMs. It does not need to load the model.
+
+## Interactive Chat with Tools
+
+```powershell
+python -m alice.cli --chat
+```
+
+ALICE will load the configured model when the first chat session starts. Type `/exit` to leave; the model is unloaded at exit.
+
+**Try these commands:**
+- "open notepad"
+- "open calculator"
+- "search for pdf files on desktop"
+- "create folder TestFolder on desktop"
+- "open browser and search for python tutorials"
+- "type text hello world"
+- "press ctrl+a"
+- "take screenshot of https://example.com"
+
+To choose an exact model key:
+
+```powershell
+python -m alice.cli --chat --model "YOUR_EXACT_LM_STUDIO_MODEL_KEY"
+```
+
+## Execute Single Intent
+
+```powershell
+python -m alice.cli --intent "open notepad and type hello"
+```
+
+## Notepad Test Scenario
+
+```powershell
+python -m alice.cli --intent "open notepad, type 'Hello from ALICE', save as test.txt on desktop"
+```
+
+## Tests
+
+```powershell
+python -m pytest -q
+python -m compileall -q alice
+```
+
+The LM Studio adapter tests use a local fake HTTP server. They verify API request/response handling but do not prove that the actual installed Qwen model loads or performs well on a particular laptop. That final check must be run on the target Windows machine.
+
+## Privacy and Safety
+
+- The default endpoint is loopback-only (`127.0.0.1`).
+- Do not enable LAN serving unless you have a specific reason and understand the access implications.
+- Never execute arbitrary model-generated shell commands. All tool calls are validated against ALICE's registered tools and permission rules.
+- Category B actions require confirmation (configurable).
+- Category C actions are restricted by default.
+- Emergency stop: move mouse to top-left corner (0,0) to trigger pyautogui failsafe.
+- All automation stays local - no cloud dependencies.

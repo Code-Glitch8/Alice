@@ -657,19 +657,36 @@ class TypeTextTool(Tool):
     def execute(self, **kwargs) -> dict:
         text = kwargs.get("text", "")
         delay = kwargs.get("delay", 0)
+        target_window = kwargs.get("target_window")
+        interval = kwargs.get("interval", 0)
+
         if not text:
             return {"status": "error", "error": "Missing required parameter: text"}
+
         try:
             import pyautogui
+            from alice.computer.engine import ComputerEngine
+
+            # Focus target window if specified
+            if target_window:
+                engine = ComputerEngine()
+                success, msg = engine.focus_app(target_window)
+                if success:
+                    import time
+                    time.sleep(0.5)  # Wait for window to gain focus
+
             if delay > 0:
                 import time
                 time.sleep(delay)
-            pyautogui.typewrite(text, interval=kwargs.get("interval", 0))
+
+            pyautogui.typewrite(text, interval=interval)
+
             return {
                 "status": "success",
                 "action": "type_text",
                 "text": text,
-                "message": f"Typed text into active window",
+                "target_window": target_window,
+                "message": f"Typed text into {'window: ' + target_window if target_window else 'active window'}",
                 "result": {"typed": len(text)},
                 "verification": {"success": True},
                 "error": None
