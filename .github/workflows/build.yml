@@ -1,0 +1,58 @@
+name: ALICE Build
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  release:
+    types: [created]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile --windowed --name "ALICE" alice/cli.py
+
+      - name: Package build artifact
+        run: |
+          Compress-Archive -Path dist/ALICE.exe -DestinationPath dist/ALICE-Windows-Portable.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ALICE-Windows-${{ matrix.python-version }}
+          path: dist/ALICE-Windows-Portable.zip
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v4
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: dist/ALICE-Windows-Portable.zip
+          asset_name: ALICE-Windows-Portable.zip
+          asset_content_type: application/zip

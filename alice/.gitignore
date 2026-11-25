@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+env/
+.venv/
+ENV/
+
+# ALICE data
+~/.alice/*.db
+~/.alice/*.db-shm
+~/.alice/*.db-wal
+~/.alice/logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+$RECYCLE.BIN/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# PyInstaller
+dist/
+build/
+*.spec
+
+# Model files
+*.gguf
+*.bin
+*.safetensors
