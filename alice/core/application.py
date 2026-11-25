@@ -38,27 +38,27 @@ You have access to tools for controlling the computer. When the user asks you to
 you should use the appropriate tool by calling it.
 
 Available tools:
-- open_app: Open an application (e.g., "notepad", "chrome", "calculator")
-- close_app: Close an application
-- focus_app: Focus an application window
-- create_folder: Create a folder
-- search_files: Search for files
-- browser_open: Open browser or search the web
-- browser_extract: Extract text content from a web page
-- browser_download: Download a file from the web
-- browser_screenshot: Take a screenshot of a web page
-- type_text: Type text into the active window
-- keyboard_shortcut: Execute a keyboard shortcut (e.g., "ctrl+c", "alt+tab")
-- mouse_move: Move mouse to coordinates
-- mouse_click: Click mouse
-- mouse_scroll: Scroll mouse wheel
-- select_text: Select text (all, word, line, paragraph)
-- copy_paste: Copy, cut, or paste
-- get_clipboard: Get clipboard content
-- set_clipboard: Set clipboard content
-- emergency_stop: Emergency stop all automation
-- system_info: Get system information
-- list_running_apps: List running applications
+- open_app(app_name: string): Open an application (e.g., "notepad", "chrome", "calculator")
+- close_app(app_name: string): Close an application
+- focus_app(app_name: string): Focus an application window
+- create_folder(path: string): Create a folder
+- search_files(query: string, folder?: string): Search for files by name or content
+- browser_open(url?: string, search?: string): Open browser or search the web
+- browser_extract(url: string, selector?: string): Extract text content from a web page
+- browser_download(url: string, destination?: string): Download a file from the web
+- browser_screenshot(url: string, full_page?: boolean, destination?: string): Take a screenshot of a web page
+- type_text(text: string, delay?: number): Type text into the active window
+- keyboard_shortcut(keys: string): Execute a keyboard shortcut (e.g., "ctrl+c", "alt+tab")
+- mouse_move(x: number, y: number, duration?: number): Move mouse to coordinates
+- mouse_click(x?: number, y?: number, button?: string, clicks?: number): Click mouse
+- mouse_scroll(clicks: number, x?: number, y?: number): Scroll mouse wheel
+- select_text(method?: string): Select text (all, word, line, paragraph)
+- copy_paste(action: string): Copy, cut, or paste (copy, cut, paste)
+- get_clipboard(): Get clipboard content
+- set_clipboard(content: string): Set clipboard content
+- emergency_stop(): Emergency stop all automation
+- system_info(): Get system information
+- list_running_apps(): List running applications
 
 When you need to use a tool, respond with a JSON object:
 {
@@ -115,6 +115,46 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         return response
 
+    def _normalize_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize tool arguments to match tool signatures.
+
+        Handles parameter name aliases that the AI might use.
+        """
+        if not arguments:
+            return arguments
+
+        # Parameter name aliases (AI-generated -> tool signature)
+        # These map common alternative names to the actual parameter names
+        param_aliases = {
+            "open_app": {"app": "app_name"},
+            "close_app": {"app": "app_name"},
+            "focus_app": {"app": "app_name"},
+            "browser_open": {"url": "url", "search": "search"},
+            "browser_extract": {"url": "url", "selector": "selector"},
+            "browser_download": {"url": "url", "destination": "destination"},
+            "browser_screenshot": {"url": "url", "full_page": "full_page", "destination": "destination"},
+            "mouse_move": {"x": "x", "y": "y", "duration": "duration"},
+            "mouse_click": {"x": "x", "y": "y", "button": "button", "clicks": "clicks"},
+            "mouse_scroll": {"clicks": "clicks", "x": "x", "y": "y"},
+            "type_text": {"text": "text", "delay": "delay"},
+            "keyboard_shortcut": {"keys": "keys"},
+            "search_files": {"query": "query", "folder": "folder"},
+            "create_folder": {"path": "path"},
+            "copy_paste": {"action": "action"},
+            "set_clipboard": {"content": "content"},
+            "select_text": {"method": "method"},
+        }
+
+        normalized = {}
+        aliases = param_aliases.get(tool_name, {})
+
+        for key, value in arguments.items():
+            # If we have an alias for this tool, use it; otherwise keep the key as-is
+            normalized_key = aliases.get(key, key)
+            normalized[normalized_key] = value
+
+        return normalized
+
     async def _execute_tool_calls(self, tool_calls: List[Dict], history: List[Dict[str, str]]) -> str:
         """Execute tool calls and return results to LLM for final response."""
         tool_results = []
@@ -129,9 +169,18 @@ Only call tools when the user explicitly requests a computer action. For normal 
             call_id = call.get("id", "call_1")
 
             try:
-                arguments = json.loads(arguments_str)
-            except json.JSONDecodeError:
+                # Handle both JSON string and dict arguments
+                if isinstance(arguments_str, str):
+                    arguments = json.loads(arguments_str)
+                elif isinstance(arguments_str, dict):
+                    arguments = arguments_str
+                else:
+                    arguments = {}
+            except (json.JSONDecodeError, TypeError):
                 arguments = {}
+
+            # Normalize parameter names to match tool signatures
+            arguments = self._normalize_tool_arguments(tool_name, arguments)
 
             # Check permissions
             tool = self.tool_registry.get(tool_name)

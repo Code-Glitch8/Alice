@@ -62,7 +62,19 @@ class OpenAppTool(Tool):
     def __init__(self):
         super().__init__("open_app", "Open an application", required_permission="A")
 
-    def execute(self, app_name: str) -> dict:
+    def execute(self, **kwargs) -> dict:
+        # Support both 'app_name' and 'app' parameter names for flexibility
+        app_name = kwargs.get("app_name") or kwargs.get("app")
+        if not app_name:
+            return {
+                "status": "error",
+                "action": "open_app",
+                "app": None,
+                "message": "Missing required parameter: app_name or app",
+                "result": None,
+                "verification": {"process_running": False},
+                "error": "Missing required parameter: app_name or app"
+            }
         try:
             from alice.computer.engine import ComputerEngine
             from alice.core.config import Config
@@ -100,7 +112,19 @@ class CloseAppTool(Tool):
     def __init__(self):
         super().__init__("close_app", "Close an application", required_permission="B")
 
-    def execute(self, app_name: str) -> dict:
+    def execute(self, **kwargs) -> dict:
+        # Support both 'app_name' and 'app' parameter names for flexibility
+        app_name = kwargs.get("app_name") or kwargs.get("app")
+        if not app_name:
+            return {
+                "status": "error",
+                "action": "close_app",
+                "app": None,
+                "message": "Missing required parameter: app_name or app",
+                "result": None,
+                "verification": {"processes_closed": 0},
+                "error": "Missing required parameter: app_name or app"
+            }
         try:
             from alice.computer.engine import ComputerEngine
             from alice.core.config import Config
@@ -137,7 +161,19 @@ class FocusAppTool(Tool):
     def __init__(self):
         super().__init__("focus_app", "Focus an application window", required_permission="A")
 
-    def execute(self, app_name: str) -> dict:
+    def execute(self, **kwargs) -> dict:
+        # Support both 'app_name' and 'app' parameter names for flexibility
+        app_name = kwargs.get("app_name") or kwargs.get("app")
+        if not app_name:
+            return {
+                "status": "error",
+                "action": "focus_app",
+                "app": None,
+                "message": "Missing required parameter: app_name or app",
+                "result": None,
+                "verification": {"window_focused": False},
+                "error": "Missing required parameter: app_name or app"
+            }
         try:
             from alice.computer.engine import ComputerEngine
             from alice.core.config import Config
@@ -172,7 +208,18 @@ class CreateFolderTool(Tool):
     def __init__(self):
         super().__init__("create_folder", "Create a folder", required_permission="A")
 
-    def execute(self, path: str) -> dict:
+    def execute(self, **kwargs) -> dict:
+        path = kwargs.get("path")
+        if not path:
+            return {
+                "status": "error",
+                "action": "create_folder",
+                "path": None,
+                "message": "Missing required parameter: path",
+                "result": None,
+                "verification": {"folder_exists": False},
+                "error": "Missing required parameter: path"
+            }
         try:
             from alice.computer.engine import ComputerEngine
             from alice.core.config import Config
@@ -209,7 +256,20 @@ class SearchFilesTool(Tool):
     def __init__(self):
         super().__init__("search_files", "Search for files", required_permission="A")
 
-    def execute(self, query: str, folder: Optional[str] = None) -> dict:
+    def execute(self, **kwargs) -> dict:
+        query = kwargs.get("query", "")
+        folder = kwargs.get("folder")
+        if not query:
+            return {
+                "status": "error",
+                "action": "search_files",
+                "query": None,
+                "folder": folder,
+                "message": "Missing required parameter: query",
+                "result": None,
+                "verification": {"results_count": 0},
+                "error": "Missing required parameter: query"
+            }
         try:
             from alice.computer.file_operations import FileOperations
             from alice.core.config import Config
@@ -232,6 +292,7 @@ class SearchFilesTool(Tool):
                 "status": "error",
                 "action": "search_files",
                 "query": query,
+                "folder": folder,
                 "message": str(e),
                 "result": None,
                 "verification": {"results_count": 0},
@@ -245,13 +306,15 @@ class BrowserOpenTool(Tool):
     def __init__(self):
         super().__init__("browser_open", "Open browser or perform search", required_permission="A")
 
-    def execute(self, url: Optional[str] = None, search: Optional[str] = None) -> dict:
+    def execute(self, **kwargs) -> dict:
         """Execute browser open/search.
 
         If search is provided and no URL, performs a web search.
         If URL is provided, navigates to it.
         Returns status dict with execution result.
         """
+        url = kwargs.get("url")
+        search = kwargs.get("search")
         try:
             import asyncio
             loop = asyncio.get_event_loop()
@@ -321,7 +384,12 @@ class BrowserExtractTool(Tool):
     def __init__(self):
         super().__init__("browser_extract", "Extract text content from a web page", required_permission="A")
 
-    def execute(self, url: str, selector: Optional[str] = None) -> dict:
+    def execute(self, **kwargs) -> dict:
+        url = kwargs.get("url")
+        selector = kwargs.get("selector")
+        if not url:
+            return {"status": "error", "error": "Missing required parameter: url"}
+        import asyncio
         import asyncio
         try:
             loop = asyncio.get_event_loop()
@@ -379,7 +447,11 @@ class BrowserDownloadTool(Tool):
     def __init__(self):
         super().__init__("browser_download", "Download a file from the web", required_permission="B")
 
-    def execute(self, url: str, destination: Optional[str] = None) -> dict:
+    def execute(self, **kwargs) -> dict:
+        url = kwargs.get("url")
+        destination = kwargs.get("destination")
+        if not url:
+            return {"status": "error", "error": "Missing required parameter: url"}
         import asyncio
         try:
             loop = asyncio.get_event_loop()
@@ -435,7 +507,12 @@ class BrowserScreenshotTool(Tool):
     def __init__(self):
         super().__init__("browser_screenshot", "Take a screenshot of a web page", required_permission="A")
 
-    def execute(self, url: str, full_page: bool = True, destination: Optional[str] = None) -> dict:
+    def execute(self, **kwargs) -> dict:
+        url = kwargs.get("url")
+        full_page = kwargs.get("full_page", True)
+        destination = kwargs.get("destination")
+        if not url:
+            return {"status": "error", "error": "Missing required parameter: url"}
         import asyncio
         try:
             loop = asyncio.get_event_loop()
