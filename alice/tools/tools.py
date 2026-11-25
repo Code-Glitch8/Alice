@@ -569,16 +569,26 @@ class TypeTextTool(Tool):
     def __init__(self):
         super().__init__("type_text", "Type text into the active window", required_permission="A")
 
-    def execute(self, text: str, delay: float = 0.05) -> dict:
+    def execute(self, **kwargs) -> dict:
+        # Support both 'text' and 'message' parameter names for flexibility
+        text = kwargs.get("text") or kwargs.get("message")
+        delay = kwargs.get("delay", 0.05)
+        if not text:
+            return {
+                "status": "error",
+                "action": "type_text",
+                "message": "Missing required parameter: text or message",
+                "error": "Missing required parameter: text or message"
+            }
         try:
             import pyautogui
-            pyautogui.write(text, interval=delay)
+            pyautogui.write(str(text), interval=delay)
             return {
                 "status": "success",
                 "action": "type_text",
-                "text": text,
-                "message": f"Typed {len(text)} characters",
-                "result": {"chars_typed": len(text)},
+                "text": str(text),
+                "message": f"Typed {len(str(text))} characters",
+                "result": {"chars_typed": len(str(text))},
                 "verification": {"attempted": True},
                 "error": None
             }
@@ -595,7 +605,16 @@ class KeyboardShortcutTool(Tool):
     def __init__(self):
         super().__init__("keyboard_shortcut", "Execute a keyboard shortcut", required_permission="A")
 
-    def execute(self, keys: str) -> dict:
+    def execute(self, **kwargs) -> dict:
+        # Support both 'keys' and 'shortcut' parameter names for flexibility
+        keys = kwargs.get("keys") or kwargs.get("shortcut")
+        if not keys:
+            return {
+                "status": "error",
+                "action": "keyboard_shortcut",
+                "message": "Missing required parameter: keys or shortcut",
+                "error": "Missing required parameter: keys or shortcut"
+            }
         try:
             import pyautogui
             # Parse keys like "ctrl+c", "alt+tab", "win+d"
@@ -623,18 +642,38 @@ class MouseMoveTool(Tool):
     def __init__(self):
         super().__init__("mouse_move", "Move mouse to coordinates", required_permission="A")
 
-    def execute(self, x: int, y: int, duration: float = 0.5) -> dict:
+    def execute(self, **kwargs) -> dict:
+        # Support 'x' and 'y' or 'coordinates' parameter names
+        coordinates = kwargs.get("coordinates") or kwargs.get("position")
+        x = kwargs.get("x")
+        y = kwargs.get("y")
+        duration = kwargs.get("duration", 0.5)
+
+        if x is None and y is None and coordinates:
+            if isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
+                x, y = coordinates[0], coordinates[1]
+            elif isinstance(coordinates, dict):
+                x = coordinates.get("x")
+                y = coordinates.get("y")
+
+        if x is None or y is None:
+            return {
+                "status": "error",
+                "action": "mouse_move",
+                "message": "Missing required parameters: x and y (or coordinates)",
+                "error": "Missing required parameters: x and y (or coordinates)"
+            }
         try:
             import pyautogui
-            pyautogui.moveTo(x, y, duration=duration)
+            pyautogui.moveTo(int(x), int(y), duration=float(duration))
             return {
                 "status": "success",
                 "action": "mouse_move",
-                "x": x,
-                "y": y,
+                "x": int(x),
+                "y": int(y),
                 "message": f"Moved mouse to ({x}, {y})",
-                "result": {"position": [x, y]},
-                "verification": {"position": pyautogui.position()},
+                "result": {"position": [int(x), int(y)]},
+                "verification": {"position": list(pyautogui.position())},
                 "error": None
             }
         except ImportError:
@@ -650,22 +689,36 @@ class MouseClickTool(Tool):
     def __init__(self):
         super().__init__("mouse_click", "Click mouse", required_permission="A")
 
-    def execute(self, x: Optional[int] = None, y: Optional[int] = None, button: str = "left", clicks: int = 1) -> dict:
+    def execute(self, **kwargs) -> dict:
+        x = kwargs.get("x")
+        y = kwargs.get("y")
+        button = kwargs.get("button", "left")
+        clicks = kwargs.get("clicks", 1)
+
+        # Support alternative parameter names
+        coordinates = kwargs.get("coordinates") or kwargs.get("position")
+        if x is None and y is None and coordinates:
+            if isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
+                x, y = coordinates[0], coordinates[1]
+            elif isinstance(coordinates, dict):
+                x = coordinates.get("x")
+                y = coordinates.get("y")
+
         try:
             import pyautogui
             if x is not None and y is not None:
-                pyautogui.click(x, y, button=button, clicks=clicks)
+                pyautogui.click(int(x), int(y), button=button, clicks=int(clicks))
             else:
-                pyautogui.click(button=button, clicks=clicks)
+                pyautogui.click(button=button, clicks=int(clicks))
             return {
                 "status": "success",
                 "action": "mouse_click",
-                "x": x,
-                "y": y,
+                "x": int(x) if x is not None else None,
+                "y": int(y) if y is not None else None,
                 "button": button,
-                "clicks": clicks,
+                "clicks": int(clicks),
                 "message": f"Clicked {button} button {clicks} time(s)",
-                "result": {"position": [x, y] if x is not None else list(pyautogui.position())},
+                "result": {"position": [int(x), int(y)] if x is not None else list(pyautogui.position())},
                 "verification": {"attempted": True},
                 "error": None
             }
@@ -682,19 +735,41 @@ class MouseScrollTool(Tool):
     def __init__(self):
         super().__init__("mouse_scroll", "Scroll mouse wheel", required_permission="A")
 
-    def execute(self, clicks: int, x: Optional[int] = None, y: Optional[int] = None) -> dict:
+    def execute(self, **kwargs) -> dict:
+        # Support 'clicks' and 'amount' parameter names
+        clicks = kwargs.get("clicks") or kwargs.get("amount")
+        if clicks is None:
+            return {
+                "status": "error",
+                "action": "mouse_scroll",
+                "message": "Missing required parameter: clicks or amount",
+                "error": "Missing required parameter: clicks or amount"
+            }
+
+        x = kwargs.get("x")
+        y = kwargs.get("y")
+
+        # Support alternative position parameter
+        position = kwargs.get("position") or kwargs.get("coordinates")
+        if position and x is None and y is None:
+            if isinstance(position, (list, tuple)) and len(position) >= 2:
+                x, y = position[0], position[1]
+            elif isinstance(position, dict):
+                x = position.get("x")
+                y = position.get("y")
+
         try:
             import pyautogui
             if x is not None and y is not None:
-                pyautogui.scroll(clicks, x=x, y=y)
+                pyautogui.scroll(int(clicks), x=int(x), y=int(y))
             else:
-                pyautogui.scroll(clicks)
+                pyautogui.scroll(int(clicks))
             return {
                 "status": "success",
                 "action": "mouse_scroll",
-                "clicks": clicks,
+                "clicks": int(clicks),
                 "message": f"Scrolled {clicks} clicks",
-                "result": {"clicks": clicks},
+                "result": {"clicks": int(clicks)},
                 "verification": {"attempted": True},
                 "error": None
             }
@@ -711,8 +786,10 @@ class SelectTextTool(Tool):
     def __init__(self):
         super().__init__("select_text", "Select text", required_permission="A")
 
-    def execute(self, method: str = "all") -> dict:
+    def execute(self, **kwargs) -> dict:
         """Select text. method: 'all', 'word', 'line', 'paragraph'"""
+        # Support 'method' and 'selection_type' parameter names
+        method = kwargs.get("method") or kwargs.get("selection_type", "all")
         try:
             import pyautogui
             if method == "all":
@@ -748,8 +825,17 @@ class CopyPasteTool(Tool):
     def __init__(self):
         super().__init__("copy_paste", "Copy, cut, or paste", required_permission="A")
 
-    def execute(self, action: str) -> dict:
-        """action: 'copy', 'cut', 'paste'"""
+    def execute(self, **kwargs) -> dict:
+        """action: 'copy', 'cut', 'paste'."""
+        # Support 'action', 'operation', 'cmd' parameter names
+        action = kwargs.get("action") or kwargs.get("operation") or kwargs.get("cmd")
+        if not action:
+            return {
+                "status": "error",
+                "action": "copy_paste",
+                "message": "Missing required parameter: action, operation, or cmd",
+                "error": "Missing required parameter: action, operation, or cmd"
+            }
         try:
             import pyautogui
             if action == "copy":
@@ -783,7 +869,7 @@ class GetClipboardTool(Tool):
     def __init__(self):
         super().__init__("get_clipboard", "Get clipboard content", required_permission="A")
 
-    def execute(self) -> dict:
+    def execute(self, **kwargs) -> dict:
         try:
             import pyperclip
             content = pyperclip.paste()
@@ -809,16 +895,25 @@ class SetClipboardTool(Tool):
     def __init__(self):
         super().__init__("set_clipboard", "Set clipboard content", required_permission="A")
 
-    def execute(self, content: str) -> dict:
+    def execute(self, **kwargs) -> dict:
+        # Support 'content', 'data', 'text' parameter names
+        content = kwargs.get("content") or kwargs.get("data") or kwargs.get("text")
+        if content is None:
+            return {
+                "status": "error",
+                "action": "set_clipboard",
+                "message": "Missing required parameter: content, data, or text",
+                "error": "Missing required parameter: content, data, or text"
+            }
         try:
             import pyperclip
             pyperclip.copy(content)
             return {
                 "status": "success",
                 "action": "set_clipboard",
-                "content": content[:100],
-                "message": f"Clipboard set ({len(content)} chars)",
-                "result": {"length": len(content)},
+                "content": str(content)[:100],
+                "message": f"Clipboard set ({len(str(content))} chars)",
+                "result": {"length": len(str(content))},
                 "verification": {"set": True},
                 "error": None
             }
@@ -835,7 +930,7 @@ class EmergencyStopTool(Tool):
     def __init__(self):
         super().__init__("emergency_stop", "Emergency stop all automation", required_permission="A")
 
-    def execute(self) -> dict:
+    def execute(self, **kwargs) -> dict:
         try:
             import pyautogui
             # Move mouse to corner to trigger failsafe
@@ -862,7 +957,7 @@ class SystemInfoTool(Tool):
     def __init__(self):
         super().__init__("system_info", "Get system information", required_permission="A")
 
-    def execute(self) -> dict:
+    def execute(self, **kwargs) -> dict:
         try:
             from alice.computer.engine import ComputerEngine
             from alice.core.config import Config
@@ -888,7 +983,7 @@ class ListRunningAppsTool(Tool):
     def __init__(self):
         super().__init__("list_running_apps", "List running applications", required_permission="A")
 
-    def execute(self) -> dict:
+    def execute(self, **kwargs) -> dict:
         try:
             from alice.computer.engine import ComputerEngine
             from alice.core.config import Config
@@ -914,7 +1009,19 @@ class SaveFileTool(Tool):
     def __init__(self):
         super().__init__("save_file", "Save content to a file", required_permission="A")
 
-    def execute(self, path: str, content: Optional[str] = None) -> dict:
+    def execute(self, **kwargs) -> dict:
+        # Support 'path' and 'file_path' parameter names
+        path = kwargs.get("path") or kwargs.get("file_path")
+        if not path:
+            return {
+                "status": "error",
+                "action": "save_file",
+                "message": "Missing required parameter: path or file_path",
+                "error": "Missing required parameter: path or file_path"
+            }
+
+        content = kwargs.get("content")
+
         try:
             from alice.computer.file_operations import FileOperations
             from alice.core.config import Config
