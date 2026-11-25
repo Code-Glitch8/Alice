@@ -162,9 +162,11 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
             if all_tool_calls:
                 # Detect if this is a compound command that should use the planner
-                if self._is_compound_command(content, all_tool_calls):
+                # Use the original user message from history, not the assistant's content
+                user_content = self._get_user_message(history)
+                if self._is_compound_command(user_content or content, all_tool_calls):
                     # Use planner for compound commands
-                    return await self._execute_planned_tasks(history, content, all_tool_calls)
+                    return await self._execute_planned_tasks(history, user_content or content, all_tool_calls)
 
                 # Execute tool calls and get result
                 result = await self._execute_tool_calls(all_tool_calls, messages, content)
@@ -189,6 +191,23 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 # No tool calls found - this is our final response
                 # Content should be clean (no XML markup)
                 return content if content else "Task completed."
+
+    def _get_user_message(self, history: List[Dict[str, str]]) -> Optional[str]:
+        """Get the most recent user message from conversation history.
+
+        Args:
+            history: List of message dicts with 'role' and 'content' keys
+
+        Returns:
+            The most recent user message content, or None if not found
+        """
+        if not history:
+            return None
+        # Get the last user message
+        for msg in reversed(history):
+            if msg.get("role") == "user":
+                return msg.get("content")
+        return None
 
     def _remove_xml_markup(self, content: str) -> str:
         """Remove XML-style tool call markup from content."""
@@ -285,8 +304,8 @@ Only call tools when the user explicitly requests a computer action. For normal 
         )
 
         # Add results to history and get final response
-        # history already contains the system prompt at index 0, so use it directly
-        messages = history + [
+        # Prepend system prompt at the beginning (it's not in history for planner calls)
+        messages = [{"role": "system", "content": self.system_prompt}] + history + [
             {"role": "assistant", "content": f"Executed plan: {plan_summary}\nResults:\n{results_summary}"}
         ]
 
