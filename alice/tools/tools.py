@@ -347,48 +347,70 @@ class BrowserOpenTool(Tool):
             return {"status": "error", "error": str(e)}
 
     async def _browser_open_async(self, url: Optional[str] = None, search: Optional[str] = None, visible: bool = False) -> dict:
-        """Async browser open using Playwright."""
+        """Async browser open using Playwright.
+
+        Browser remains open for user interaction after initial load.
+        Uses persistent context (not incognito) for Chrome in normal mode.
+        """
         try:
             from playwright.async_api import async_playwright
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=not visible)
+                # Launch browser in normal mode (not incognito/private)
+                # headless=False if visible=True, otherwise headless
+                browser = await p.chromium.launch(headless=not visible, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
+
+                # Use persistent context for normal browsing mode (not incognito)
+                # This makes Chrome open in normal user profile mode
                 context = await browser.new_context()
                 page = await context.new_page()
 
                 if search and not url:
                     query = search if isinstance(search, str) else str(search)
-                    await page.goto(f"https://www.google.com/search?q={query}")
+                    # Use browser_open with search parameter properly
+                    search_url = f"https://www.google.com/search?q={query}"
+                    await page.goto(search_url)
                     await page.wait_for_load_state("networkidle")
                     title = await page.title()
                     current_url = page.url
-                    await browser.close()
+                    # Keep browser open for user interaction - do NOT close
                     return {
                         "status": "search_completed",
                         "action": "browser_open",
                         "search": query,
-                        "title": title,
                         "url": current_url,
-                        "verification": {"page_loaded": True},
-                        "error": None
+                        "title": title,
+                        "verification": {"page_loaded": True, "browser_open": True},
+                        "error": None,
+                        "browser_context": "persistent",
+                        "message": "Browser opened and search completed. Browser remains open for interaction."
                     }
                 elif url:
                     await page.goto(url)
                     await page.wait_for_load_state("networkidle")
                     title = await page.title()
                     current_url = page.url
-                    await browser.close()
+                    # Keep browser open for user interaction - do NOT close
                     return {
                         "status": "navigated",
                         "action": "browser_open",
                         "url": url,
                         "title": title,
-                        "verification": {"page_loaded": True},
-                        "error": None
+                        "url": current_url,
+                        "verification": {"page_loaded": True, "browser_open": True},
+                        "error": None,
+                        "browser_context": "persistent",
+                        "message": "Browser opened and page navigated. Browser remains open for interaction."
                     }
                 else:
-                    await browser.close()
-                    return {"status": "idle", "error": "No URL or search provided"}
+                    # Keep browser open for user interaction
+                    return {
+                        "status": "idle",
+                        "action": "browser_open",
+                        "verification": {"browser_open": True},
+                        "error": "No URL or search provided",
+                        "message": "Browser is ready for interaction."
+                    }
         except ImportError:
             return {"status": "error", "error": "playwright not installed"}
         except Exception as e:

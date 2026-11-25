@@ -1,0 +1,3 @@
+- [Comprehensive Fixes](comprehensive-fixes.md) — All fixes for ALICE 1.0.8 tool execution and browser lifecycle issues
+- [Multi-tool Fix](multi-tool-fix.md) — Fix for compound command execution in ALICE's Windows desktop assistant
+- [System Prompt Duplication](system-prompt-duplication.md) — Fix for Jinja Exception "System message must be at the beginning"
