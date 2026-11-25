@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from alice.ai.lmstudio_adapter import LMStudioAdapter
 from alice.ai.runtime_manager import RuntimeManager
-from alice.tools.tools import create_default_tools, ToolDispatcher
-from alice.planner.planner import TaskPlanner
+from alice.tools.tools import create_default_tools, ToolDispatcher, Tool
+from alice.planner.planner import TaskPlanner, TaskStep
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ class AliceApplication:
         self.max_tool_calls = 5  # Prevent infinite loops
         self.current_tool_call_count = 0
 
-        # System prompt that enables tool calling
+        # System prompt for fallback text-based tool calling
         self.system_prompt = """You are ALICE, a helpful local Windows desktop assistant.
 You have access to tools for controlling the computer. When the user asks you to perform an action on their computer, you should use the appropriate tool by calling it.
 
@@ -68,19 +68,6 @@ Available tools:
 - get_open_apps(): List applications opened by ALICE
 - get_app_status(app_name: string): Get status of a specific application
 
-When you need to use a tool, respond with a JSON object wrapped in markdown:
-```json
-{
-  "tool_calls": [
-    {
-      "id": "call_1",
-      "type": "function",
-      "function": {"name": "tool_name", "arguments": "{\"param\": \"value\"}"}
-    }
-  ]
-}
-```
-
 Only call tools when the user explicitly requests a computer action. For normal conversation, respond normally without tool calls."""
 
     async def initialize(self) -> bool:
@@ -103,18 +90,26 @@ Only call tools when the user explicitly requests a computer action. For normal 
             {"role": "user", "content": prompt},
         ])
 
-    async def chat_with_tools(self, history: List[Dict[str, str]]) -> str:
-        """Chat with tool calling support."""
+    async def chat_with_tools(self, history: List[Dict[str, str]], tools: Optional[List[Dict]] = None) -> str:
+        """Chat with tool calling support.
+
+        Uses native tool calling when tools are provided to LM Studio.
+        Falls back to parsing AI response if tool calls are returned as text/JSON.
+        """
         if not self.initialized and not await self.initialize():
             raise RuntimeError(self.ai_adapter.last_error or "LM Studio is unavailable")
 
         # Prepare messages with system prompt
         messages = [{"role": "system", "content": self.system_prompt}] + history
 
-        # Get response from LLM
-        response = await self.runtime.chat(messages)
+        # Get tools for API if not provided
+        if tools is None:
+            tools = self.get_tools_for_api()
 
-        # Check if response contains tool calls (handle both raw JSON and markdown-fenced)
+        # Get response from LLM with native tool calling support
+        response = await self.runtime.chat(messages, tools=tools)
+
+        # Check if response contains tool calls (handle both native and fallback formats)
         parsed = self._parse_ai_response(response)
         if parsed is not None:
             if "tool_calls" in parsed:
@@ -132,6 +127,8 @@ Only call tools when the user explicitly requests a computer action. For normal 
         AI may return:
         - Raw JSON: {"tool_calls": [...], "content": "..."}
         - Markdown-fenced: ```json\n{"tool_calls": [...]}\n```
+
+        Also handles the new format from LM Studio with has_tool_calls flag.
         """
         if not response:
             return None
@@ -152,9 +149,163 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         # Try raw JSON parsing
         try:
-            return json.loads(response)
+            parsed = json.loads(response)
+            # Check for new format with has_tool_calls flag
+            if parsed.get("has_tool_calls") and parsed.get("tool_calls"):
+                return {
+                    "tool_calls": parsed.get("tool_calls", []),
+                    "content": parsed.get("content")
+                }
+            return parsed
         except json.JSONDecodeError:
             return None
+
+    def get_tools_for_api(self) -> List[Dict[str, Any]]:
+        """Generate OpenAI-compatible tool definitions from the tool registry.
+
+        This is used to send tool definitions to LM Studio for native function calling.
+        """
+        tools = []
+        for tool in self.tool_registry.list_tools():
+            # Get tool signature information
+            tool_def = {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            }
+
+            # Add parameter information based on tool type
+            # This is a simplified mapping - in a full implementation we'd inspect
+            # the tool's signature
+            if tool.name == "open_app":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "app_name": {"type": "string", "description": "Name of the application to open"},
+                    "target_path": {"type": "string", "description": "Optional target path or URL", "default": None}
+                }
+                tool_def["function"]["required"] = ["app_name"]
+            elif tool.name == "close_app":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "app_name": {"type": "string", "description": "Name of the application to close"}
+                }
+                tool_def["function"]["required"] = ["app_name"]
+            elif tool.name == "focus_app":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "app_name": {"type": "string", "description": "Name of the application to focus"}
+                }
+                tool_def["function"]["required"] = ["app_name"]
+            elif tool.name == "create_folder":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "path": {"type": "string", "description": "Path of the folder to create"}
+                }
+                tool_def["function"]["required"] = ["path"]
+            elif tool.name == "search_files":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "query": {"type": "string", "description": "Search query"},
+                    "folder": {"type": "string", "description": "Folder to search in (optional)", "default": None}
+                }
+                tool_def["function"]["required"] = ["query"]
+            elif tool.name == "browser_open":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "url": {"type": "string", "description": "URL to open", "default": None},
+                    "search": {"type": "string", "description": "Search term for web search", "default": None},
+                    "visible": {"type": "boolean", "description": "Whether to open browser visibly", "default": False}
+                }
+            elif tool.name == "browser_extract":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "url": {"type": "string", "description": "URL to extract content from"},
+                    "selector": {"type": "string", "description": "CSS selector (optional)", "default": None},
+                    "visible": {"type": "boolean", "description": "Whether to open browser visibly", "default": False}
+                }
+                tool_def["function"]["required"] = ["url"]
+            elif tool.name == "browser_download":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "url": {"type": "string", "description": "URL of file to download"},
+                    "destination": {"type": "string", "description": "Destination path (optional)", "default": None}
+                }
+                tool_def["function"]["required"] = ["url"]
+            elif tool.name == "browser_screenshot":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "url": {"type": "string", "description": "URL to screenshot"},
+                    "full_page": {"type": "boolean", "description": "Capture full page", "default": True},
+                    "destination": {"type": "string", "description": "Destination path (optional)", "default": None},
+                    "visible": {"type": "boolean", "description": "Whether to open browser visibly", "default": False}
+                }
+                tool_def["function"]["required"] = ["url"]
+            elif tool.name == "type_text":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "text": {"type": "string", "description": "Text to type"},
+                    "delay": {"type": "number", "description": "Delay between keystrokes", "default": 0},
+                    "interval": {"type": "number", "description": "Typing interval", "default": 0}
+                }
+                tool_def["function"]["required"] = ["text"]
+            elif tool.name == "keyboard_shortcut":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "keys": {"type": "string", "description": "Keys to press (e.g., 'ctrl+c', 'alt+tab')"}
+                }
+                tool_def["function"]["required"] = ["keys"]
+            elif tool.name == "mouse_move":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "x": {"type": "number", "description": "X coordinate"},
+                    "y": {"type": "number", "description": "Y coordinate"},
+                    "duration": {"type": "number", "description": "Duration in seconds", "default": 0}
+                }
+                tool_def["function"]["required"] = ["x", "y"]
+            elif tool.name == "mouse_click":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "x": {"type": "number", "description": "X coordinate (optional)", "default": None},
+                    "y": {"type": "number", "description": "Y coordinate (optional)", "default": None},
+                    "button": {"type": "string", "description": "Button to click ('left', 'right', 'middle')", "default": "left"},
+                    "clicks": {"type": "number", "description": "Number of clicks", "default": 1}
+                }
+            elif tool.name == "mouse_scroll":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "clicks": {"type": "number", "description": "Number of scroll notches", "default": 3},
+                    "x": {"type": "number", "description": "X coordinate (optional)", "default": None},
+                    "y": {"type": "number", "description": "Y coordinate (optional)", "default": None}
+                }
+                tool_def["function"]["required"] = ["clicks"]
+            elif tool.name == "select_text":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "method": {"type": "string", "description": "Selection method ('all', 'word', 'line', 'paragraph')", "default": "all"}
+                }
+            elif tool.name == "copy_paste":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "action": {"type": "string", "description": "Action ('copy', 'cut', 'paste')"}
+                }
+                tool_def["function"]["required"] = ["action"]
+            elif tool.name == "get_clipboard":
+                tool_def["function"]["parameters"]["properties"] = {}
+            elif tool.name == "set_clipboard":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "content": {"type": "string", "description": "Content to set to clipboard"}
+                }
+                tool_def["function"]["required"] = ["content"]
+            elif tool.name == "system_info":
+                tool_def["function"]["parameters"]["properties"] = {}
+            elif tool.name == "list_running_apps":
+                tool_def["function"]["parameters"]["properties"] = {}
+            elif tool.name == "get_app_status":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "app_name": {"type": "string", "description": "Name of the application"}
+                }
+                tool_def["function"]["required"] = ["app_name"]
+            elif tool.name == "close_all_apps":
+                tool_def["function"]["parameters"]["properties"] = {}
+            elif tool.name == "get_open_apps":
+                tool_def["function"]["parameters"]["properties"] = {}
+            elif tool.name == "emergency_stop":
+                tool_def["function"]["parameters"]["properties"] = {}
+
+            tools.append(tool_def)
+
+        return tools
 
     def _normalize_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize tool arguments to match tool signatures.

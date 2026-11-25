@@ -341,9 +341,36 @@ class LMStudioAdapter(AIProvider):
             retry_count
         )
 
-        # Handle tool calls - preserve for ALICE's tool execution system
+        # Handle tool calls - preserve native format for ALICE's tool execution system
         if tool_calls:
-            return json.dumps({"tool_calls": tool_calls, "content": content}, ensure_ascii=False), {
+            # Normalize tool_calls: ensure arguments are JSON strings (OpenAI format)
+            normalized_tool_calls = []
+            for tc in tool_calls:
+                if isinstance(tc, dict) and "function" in tc:
+                    func = tc.get("function", {})
+                    args = func.get("arguments", {})
+                    # Ensure arguments is a JSON string (OpenAI-compatible wire format)
+                    if isinstance(args, dict):
+                        args = json.dumps(args, ensure_ascii=False)
+                    normalized_tc = {
+                        "id": tc.get("id"),
+                        "type": tc.get("type", "function"),
+                        "function": {
+                            "name": func.get("name"),
+                            "arguments": args
+                        }
+                    }
+                    normalized_tool_calls.append(normalized_tc)
+                else:
+                    normalized_tool_calls.append(tc)
+
+            # Return content and tool_calls as JSON string for ALICE to handle
+            result = {
+                "content": content if content else None,
+                "tool_calls": normalized_tool_calls,
+                "has_tool_calls": True
+            }
+            return json.dumps(result, ensure_ascii=False), {
                 "finish_reason": finish_reason,
                 "has_reasoning": has_reasoning,
                 "tool_call_count": tool_call_count,
