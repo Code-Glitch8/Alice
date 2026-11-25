@@ -9,6 +9,7 @@ import asyncio
 import shutil
 import zipfile
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
@@ -24,48 +25,56 @@ class FileOperations:
 
     # Search operations
     def search_files(self, query: str, folder: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Search for files by name or extension within a folder."""
+        """Search for files by name or extension within a folder.
+
+        If no folder is specified, searches across all allowed locations.
+        """
         results = []
-        search_folder = Path(folder) if folder else Path.home()
+        query_lower = query.lower()
 
-        # Restrict to allowed locations
-        if str(search_folder) not in self.allowed_locations:
-            logger.warning(f"Search folder {search_folder} not in allowed locations")
-            return results
+        # Determine search locations: specific folder or all allowed locations
+        if folder:
+            search_locations = [Path(folder)]
+        else:
+            search_locations = [Path(loc) for loc in self.allowed_locations if Path(loc).exists()]
 
-        try:
-            if not search_folder.exists():
-                return results
+        for search_folder in search_locations:
+            # Restrict to allowed locations
+            if str(search_folder) not in self.allowed_locations:
+                logger.warning(f"Search folder {search_folder} not in allowed locations")
+                continue
 
-            query_lower = query.lower()
+            try:
+                if not search_folder.exists():
+                    continue
 
-            # If query looks like an extension (starts with .)
-            if query_lower.startswith('.'):
-                ext = query_lower
-                for file_path in search_folder.rglob('*'):
-                    if file_path.is_file() and file_path.suffix.lower() == ext:
-                        results.append({
-                            "name": file_path.name,
-                            "path": str(file_path),
-                            "size": file_path.stat().st_size,
-                            "modified": file_path.stat().st_mtime,
-                        })
-            else:
-                # Search by name pattern
-                for file_path in search_folder.rglob('*'):
-                    if file_path.is_file() and query_lower in file_path.name.lower():
-                        results.append({
-                            "name": file_path.name,
-                            "path": str(file_path),
-                            "size": file_path.stat().st_size,
-                            "modified": file_path.stat().st_mtime,
-                        })
+                # If query looks like an extension (starts with .)
+                if query_lower.startswith('.'):
+                    ext = query_lower
+                    for file_path in search_folder.rglob('*'):
+                        if file_path.is_file() and file_path.suffix.lower() == ext:
+                            results.append({
+                                "name": file_path.name,
+                                "path": str(file_path),
+                                "size": file_path.stat().st_size,
+                                "modified": file_path.stat().st_mtime,
+                            })
+                else:
+                    # Search by name pattern
+                    for file_path in search_folder.rglob('*'):
+                        if file_path.is_file() and query_lower in file_path.name.lower():
+                            results.append({
+                                "name": file_path.name,
+                                "path": str(file_path),
+                                "size": file_path.stat().st_size,
+                                "modified": file_path.stat().st_mtime,
+                            })
 
-            # Sort by modification time, newest first
-            results.sort(key=lambda x: x["modified"], reverse=True)
+            except Exception as e:
+                logger.error(f"Search error in {search_folder}: {e}")
 
-        except Exception as e:
-            logger.error(f"Search error in {search_folder}: {e}")
+        # Sort by modification time, newest first, then by name for consistency
+        results.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
 
         return results
 

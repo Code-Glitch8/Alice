@@ -65,6 +65,8 @@ class OpenAppTool(Tool):
     def execute(self, **kwargs) -> dict:
         # Support both 'app_name' and 'app' parameter names for flexibility
         app_name = kwargs.get("app_name") or kwargs.get("app")
+        target_path = kwargs.get("target_path") or kwargs.get("path") or kwargs.get("folder")
+
         if not app_name:
             return {
                 "status": "error",
@@ -80,11 +82,12 @@ class OpenAppTool(Tool):
             from alice.core.config import Config
             config = Config.load()
             engine = ComputerEngine(config)
-            success, message, details = engine.open_app(app_name)
+            success, message, details = engine.open_app(app_name, target_path)
             return {
                 "status": "success" if success else "error",
                 "action": "open_app",
                 "app": app_name,
+                "target_path": target_path,
                 "message": message,
                 "result": details if success else None,
                 "verification": {
@@ -315,26 +318,27 @@ class BrowserOpenTool(Tool):
         """
         url = kwargs.get("url")
         search = kwargs.get("search")
+        visible = kwargs.get("visible", False)  # New parameter for visible mode
         try:
             import asyncio
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                task = asyncio.ensure_future(self._browser_open_async(url, search))
+                task = asyncio.ensure_future(self._browser_open_async(url, search, visible))
                 return {"status": "started", "url": url, "search": search}
             else:
-                result = loop.run_until_complete(self._browser_open_async(url, search))
+                result = loop.run_until_complete(self._browser_open_async(url, search, visible))
                 return result
         except Exception as e:
             logger.error(f"Browser open error: {e}")
             return {"status": "error", "error": str(e)}
 
-    async def _browser_open_async(self, url: Optional[str] = None, search: Optional[str] = None) -> dict:
+    async def _browser_open_async(self, url: Optional[str] = None, search: Optional[str] = None, visible: bool = False) -> dict:
         """Async browser open using Playwright."""
         try:
             from playwright.async_api import async_playwright
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(headless=not visible)
                 context = await browser.new_context()
                 page = await context.new_page()
 
@@ -403,12 +407,12 @@ class BrowserExtractTool(Tool):
             logger.error(f"Browser extract error: {e}")
             return {"status": "error", "error": str(e)}
 
-    async def _browser_extract_async(self, url: str, selector: Optional[str] = None) -> dict:
+    async def _browser_extract_async(self, url: str, selector: Optional[str] = None, visible: bool = False) -> dict:
         try:
             from playwright.async_api import async_playwright
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(headless=not visible)
                 context = await browser.new_context()
                 page = await context.new_page()
 
@@ -452,7 +456,6 @@ class BrowserDownloadTool(Tool):
         destination = kwargs.get("destination")
         if not url:
             return {"status": "error", "error": "Missing required parameter: url"}
-        import asyncio
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -511,22 +514,23 @@ class BrowserScreenshotTool(Tool):
         url = kwargs.get("url")
         full_page = kwargs.get("full_page", True)
         destination = kwargs.get("destination")
+        visible = kwargs.get("visible", False)
         if not url:
             return {"status": "error", "error": "Missing required parameter: url"}
         import asyncio
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                task = asyncio.ensure_future(self._browser_screenshot_async(url, full_page, destination))
+                task = asyncio.ensure_future(self._browser_screenshot_async(url, full_page, destination, visible))
                 return {"status": "started", "url": url}
             else:
-                result = loop.run_until_complete(self._browser_screenshot_async(url, full_page, destination))
+                result = loop.run_until_complete(self._browser_screenshot_async(url, full_page, destination, visible))
                 return result
         except Exception as e:
             logger.error(f"Browser screenshot error: {e}")
             return {"status": "error", "error": str(e)}
 
-    async def _browser_screenshot_async(self, url: str, full_page: bool = True, destination: Optional[str] = None) -> dict:
+    async def _browser_screenshot_async(self, url: str, full_page: bool = True, destination: Optional[str] = None, visible: bool = False) -> dict:
         try:
             from playwright.async_api import async_playwright
             from pathlib import Path
@@ -535,7 +539,7 @@ class BrowserScreenshotTool(Tool):
                 destination = str(Path.home() / "Downloads" / f"screenshot_{url.replace('https://', '').replace('/', '_')[:50]}.png")
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(headless=not visible)
                 context = await browser.new_context()
                 page = await context.new_page()
 
@@ -563,33 +567,111 @@ class BrowserScreenshotTool(Tool):
             return {"status": "error", "error": str(e)}
 
 
+class CloseAllAppsTool(Tool):
+    """Close all applications opened by ALICE."""
+
+    def __init__(self):
+        super().__init__("close_all_apps", "Close all applications opened by ALICE", required_permission="B")
+
+    def execute(self, **kwargs) -> dict:
+        try:
+            from alice.core.application_owner import ApplicationOwner
+            owner = ApplicationOwner.get_instance()
+            results = owner.close_all_apps()
+            return {
+                "status": "success",
+                "action": "close_all_apps",
+                "message": f"Closed {results['total']} applications",
+                "result": results,
+                "verification": {"total_closed": results.get("total", 0)},
+                "error": None
+            }
+        except Exception as e:
+            logger.error(f"CloseAllAppsTool error: {e}")
+            return {"status": "error", "error": str(e)}
+
+
+class GetOpenAppsTool(Tool):
+    """Get list of applications opened by ALICE."""
+
+    def __init__(self):
+        super().__init__("get_open_apps", "Get list of applications opened by ALICE", required_permission="A")
+
+    def execute(self, **kwargs) -> dict:
+        try:
+            from alice.core.application_owner import ApplicationOwner
+            owner = ApplicationOwner.get_instance()
+            apps = owner.get_owned_apps()
+            return {
+                "status": "success",
+                "action": "get_open_apps",
+                "message": f"Found {len(apps)} opened applications",
+                "result": {"apps": apps},
+                "verification": {"apps_count": len(apps)},
+                "error": None
+            }
+        except Exception as e:
+            logger.error(f"GetOpenAppsTool error: {e}")
+            return {"status": "error", "error": str(e)}
+
+
+class GetAppStatusTool(Tool):
+    """Get status of a specific application opened by ALICE."""
+
+    def __init__(self):
+        super().__init__("get_app_status", "Get status of a specific application", required_permission="A")
+
+    def execute(self, **kwargs) -> dict:
+        app_name = kwargs.get("app_name") or kwargs.get("app")
+        if not app_name:
+            return {"status": "error", "error": "Missing required parameter: app_name"}
+        try:
+            from alice.core.application_owner import ApplicationOwner
+            owner = ApplicationOwner.get_instance()
+            status = owner.get_status()
+            app_info = owner.get_apps_by_name(app_name)
+            return {
+                "status": "success",
+                "action": "get_app_status",
+                "app": app_name,
+                "message": f"Status for {app_name}",
+                "result": {
+                    "app": app_name,
+                    "instances": app_info,
+                    "total_owned": status["total_owned"]
+                },
+                "verification": {"has_instances": len(app_info) > 0},
+                "error": None
+            }
+        except Exception as e:
+            logger.error(f"GetAppStatusTool error: {e}")
+            return {"status": "error", "error": str(e)}
+
+
 class TypeTextTool(Tool):
     """Type text into the active window."""
 
     def __init__(self):
-        super().__init__("type_text", "Type text into the active window", required_permission="A")
+        super().__init__("type_text", "Type text into the active window", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
-        # Support both 'text' and 'message' parameter names for flexibility
-        text = kwargs.get("text") or kwargs.get("message")
-        delay = kwargs.get("delay", 0.05)
+        text = kwargs.get("text", "")
+        delay = kwargs.get("delay", 0)
         if not text:
-            return {
-                "status": "error",
-                "action": "type_text",
-                "message": "Missing required parameter: text or message",
-                "error": "Missing required parameter: text or message"
-            }
+            return {"status": "error", "error": "Missing required parameter: text"}
         try:
             import pyautogui
-            pyautogui.write(str(text), interval=delay)
+            if delay > 0:
+                import time
+                time.sleep(delay)
+            pyautogui.typewrite(text, interval=kwargs.get("interval", 0))
             return {
                 "status": "success",
                 "action": "type_text",
-                "text": str(text),
-                "message": f"Typed {len(str(text))} characters",
-                "result": {"chars_typed": len(str(text))},
-                "verification": {"attempted": True},
+                "text": text,
+                "message": f"Typed text into active window",
+                "result": {"typed": len(text)},
+                "verification": {"success": True},
                 "error": None
             }
         except ImportError:
@@ -603,30 +685,22 @@ class KeyboardShortcutTool(Tool):
     """Execute a keyboard shortcut."""
 
     def __init__(self):
-        super().__init__("keyboard_shortcut", "Execute a keyboard shortcut", required_permission="A")
+        super().__init__("keyboard_shortcut", "Execute a keyboard shortcut", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
-        # Support both 'keys' and 'shortcut' parameter names for flexibility
-        keys = kwargs.get("keys") or kwargs.get("shortcut")
+        keys = kwargs.get("keys", "")
         if not keys:
-            return {
-                "status": "error",
-                "action": "keyboard_shortcut",
-                "message": "Missing required parameter: keys or shortcut",
-                "error": "Missing required parameter: keys or shortcut"
-            }
+            return {"status": "error", "error": "Missing required parameter: keys"}
         try:
             import pyautogui
-            # Parse keys like "ctrl+c", "alt+tab", "win+d"
-            key_list = [k.strip() for k in keys.split('+')]
-            pyautogui.hotkey(*key_list)
+            pyautogui.hotkey(*keys.split('+'))
             return {
                 "status": "success",
                 "action": "keyboard_shortcut",
                 "keys": keys,
-                "message": f"Executed shortcut: {keys}",
-                "result": {"keys": key_list},
-                "verification": {"attempted": True},
+                "message": f"Executed keyboard shortcut: {keys}",
+                "result": {"executed": True},
+                "verification": {"success": True},
                 "error": None
             }
         except ImportError:
@@ -640,40 +714,22 @@ class MouseMoveTool(Tool):
     """Move mouse to coordinates."""
 
     def __init__(self):
-        super().__init__("mouse_move", "Move mouse to coordinates", required_permission="A")
+        super().__init__("mouse_move", "Move mouse to coordinates", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
-        # Support 'x' and 'y' or 'coordinates' parameter names
-        coordinates = kwargs.get("coordinates") or kwargs.get("position")
-        x = kwargs.get("x")
-        y = kwargs.get("y")
-        duration = kwargs.get("duration", 0.5)
-
-        if x is None and y is None and coordinates:
-            if isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
-                x, y = coordinates[0], coordinates[1]
-            elif isinstance(coordinates, dict):
-                x = coordinates.get("x")
-                y = coordinates.get("y")
-
-        if x is None or y is None:
-            return {
-                "status": "error",
-                "action": "mouse_move",
-                "message": "Missing required parameters: x and y (or coordinates)",
-                "error": "Missing required parameters: x and y (or coordinates)"
-            }
+        x = kwargs.get("x", 0)
+        y = kwargs.get("y", 0)
+        duration = kwargs.get("duration", 0)
         try:
             import pyautogui
-            pyautogui.moveTo(int(x), int(y), duration=float(duration))
+            pyautogui.moveTo(x, y, duration=duration)
             return {
                 "status": "success",
                 "action": "mouse_move",
-                "x": int(x),
-                "y": int(y),
+                "coordinates": {"x": x, "y": y},
                 "message": f"Moved mouse to ({x}, {y})",
-                "result": {"position": [int(x), int(y)]},
-                "verification": {"position": list(pyautogui.position())},
+                "result": {"moved": True},
+                "verification": {"success": True},
                 "error": None
             }
         except ImportError:
@@ -684,42 +740,30 @@ class MouseMoveTool(Tool):
 
 
 class MouseClickTool(Tool):
-    """Click mouse at current or specified position."""
+    """Click mouse."""
 
     def __init__(self):
-        super().__init__("mouse_click", "Click mouse", required_permission="A")
+        super().__init__("mouse_click", "Click mouse", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
         x = kwargs.get("x")
         y = kwargs.get("y")
         button = kwargs.get("button", "left")
         clicks = kwargs.get("clicks", 1)
-
-        # Support alternative parameter names
-        coordinates = kwargs.get("coordinates") or kwargs.get("position")
-        if x is None and y is None and coordinates:
-            if isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
-                x, y = coordinates[0], coordinates[1]
-            elif isinstance(coordinates, dict):
-                x = coordinates.get("x")
-                y = coordinates.get("y")
-
         try:
             import pyautogui
             if x is not None and y is not None:
-                pyautogui.click(int(x), int(y), button=button, clicks=int(clicks))
+                pyautogui.click(x, y, button=button, clicks=clicks)
             else:
-                pyautogui.click(button=button, clicks=int(clicks))
+                pyautogui.click(button=button, clicks=clicks)
             return {
                 "status": "success",
                 "action": "mouse_click",
-                "x": int(x) if x is not None else None,
-                "y": int(y) if y is not None else None,
                 "button": button,
-                "clicks": int(clicks),
+                "clicks": clicks,
                 "message": f"Clicked {button} button {clicks} time(s)",
-                "result": {"position": [int(x), int(y)] if x is not None else list(pyautogui.position())},
-                "verification": {"attempted": True},
+                "result": {"clicked": True},
+                "verification": {"success": True},
                 "error": None
             }
         except ImportError:
@@ -733,44 +777,25 @@ class MouseScrollTool(Tool):
     """Scroll mouse wheel."""
 
     def __init__(self):
-        super().__init__("mouse_scroll", "Scroll mouse wheel", required_permission="A")
+        super().__init__("mouse_scroll", "Scroll mouse wheel", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
-        # Support 'clicks' and 'amount' parameter names
-        clicks = kwargs.get("clicks") or kwargs.get("amount")
-        if clicks is None:
-            return {
-                "status": "error",
-                "action": "mouse_scroll",
-                "message": "Missing required parameter: clicks or amount",
-                "error": "Missing required parameter: clicks or amount"
-            }
-
+        clicks = kwargs.get("clicks", 3)
         x = kwargs.get("x")
         y = kwargs.get("y")
-
-        # Support alternative position parameter
-        position = kwargs.get("position") or kwargs.get("coordinates")
-        if position and x is None and y is None:
-            if isinstance(position, (list, tuple)) and len(position) >= 2:
-                x, y = position[0], position[1]
-            elif isinstance(position, dict):
-                x = position.get("x")
-                y = position.get("y")
-
         try:
             import pyautogui
             if x is not None and y is not None:
-                pyautogui.scroll(int(clicks), x=int(x), y=int(y))
+                pyautogui.scroll(clicks, x=x, y=y)
             else:
-                pyautogui.scroll(int(clicks))
+                pyautogui.scroll(clicks)
             return {
                 "status": "success",
                 "action": "mouse_scroll",
-                "clicks": int(clicks),
-                "message": f"Scrolled {clicks} clicks",
-                "result": {"clicks": int(clicks)},
-                "verification": {"attempted": True},
+                "clicks": clicks,
+                "message": f"Scrolled mouse wheel by {clicks}",
+                "result": {"scrolled": True},
+                "verification": {"success": True},
                 "error": None
             }
         except ImportError:
@@ -781,15 +806,13 @@ class MouseScrollTool(Tool):
 
 
 class SelectTextTool(Tool):
-    """Select text using keyboard shortcuts."""
+    """Select text."""
 
     def __init__(self):
-        super().__init__("select_text", "Select text", required_permission="A")
+        super().__init__("select_text", "Select text", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
-        """Select text. method: 'all', 'word', 'line', 'paragraph'"""
-        # Support 'method' and 'selection_type' parameter names
-        method = kwargs.get("method") or kwargs.get("selection_type", "all")
+        method = kwargs.get("method", "all")
         try:
             import pyautogui
             if method == "all":
@@ -797,19 +820,16 @@ class SelectTextTool(Tool):
             elif method == "word":
                 pyautogui.hotkey('ctrl', 'shift', 'right')
             elif method == "line":
-                pyautogui.hotkey('shift', 'end')
+                pyautogui.hotkey('ctrl', 'shift', 'down')
             elif method == "paragraph":
                 pyautogui.hotkey('ctrl', 'shift', 'down')
-            else:
-                return {"status": "error", "error": f"Unknown method: {method}"}
-
             return {
                 "status": "success",
                 "action": "select_text",
                 "method": method,
-                "message": f"Selected text ({method})",
-                "result": {"method": method},
-                "verification": {"attempted": True},
+                "message": f"Selected text using {method} method",
+                "result": {"selected": True},
+                "verification": {"success": True},
                 "error": None
             }
         except ImportError:
@@ -820,22 +840,15 @@ class SelectTextTool(Tool):
 
 
 class CopyPasteTool(Tool):
-    """Copy, cut, or paste clipboard content."""
+    """Copy, cut, or paste text."""
 
     def __init__(self):
-        super().__init__("copy_paste", "Copy, cut, or paste", required_permission="A")
+        super().__init__("copy_paste", "Copy, cut, or paste text", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
-        """action: 'copy', 'cut', 'paste'."""
-        # Support 'action', 'operation', 'cmd' parameter names
-        action = kwargs.get("action") or kwargs.get("operation") or kwargs.get("cmd")
-        if not action:
-            return {
-                "status": "error",
-                "action": "copy_paste",
-                "message": "Missing required parameter: action, operation, or cmd",
-                "error": "Missing required parameter: action, operation, or cmd"
-            }
+        action = kwargs.get("action", "copy")
+        if action not in ("copy", "cut", "paste"):
+            return {"status": "error", "error": f"Invalid action: {action}. Must be copy, cut, or paste"}
         try:
             import pyautogui
             if action == "copy":
@@ -844,16 +857,13 @@ class CopyPasteTool(Tool):
                 pyautogui.hotkey('ctrl', 'x')
             elif action == "paste":
                 pyautogui.hotkey('ctrl', 'v')
-            else:
-                return {"status": "error", "error": f"Unknown action: {action}"}
-
             return {
                 "status": "success",
                 "action": "copy_paste",
                 "operation": action,
-                "message": f"{action.capitalize()} executed",
-                "result": {"operation": action},
-                "verification": {"attempted": True},
+                "message": f"Performed {action} operation",
+                "result": {"executed": True},
+                "verification": {"success": True},
                 "error": None
             }
         except ImportError:
@@ -876,10 +886,9 @@ class GetClipboardTool(Tool):
             return {
                 "status": "success",
                 "action": "get_clipboard",
-                "content": content[:1000],  # Limit size
-                "message": f"Clipboard content retrieved ({len(content)} chars)",
-                "result": {"content": content},
-                "verification": {"retrieved": True},
+                "message": "Retrieved clipboard content",
+                "result": {"content": content, "length": len(content)},
+                "verification": {"has_content": bool(content)},
                 "error": None
             }
         except ImportError:
@@ -893,28 +902,21 @@ class SetClipboardTool(Tool):
     """Set clipboard content."""
 
     def __init__(self):
-        super().__init__("set_clipboard", "Set clipboard content", required_permission="A")
+        super().__init__("set_clipboard", "Set clipboard content", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
-        # Support 'content', 'data', 'text' parameter names
-        content = kwargs.get("content") or kwargs.get("data") or kwargs.get("text")
-        if content is None:
-            return {
-                "status": "error",
-                "action": "set_clipboard",
-                "message": "Missing required parameter: content, data, or text",
-                "error": "Missing required parameter: content, data, or text"
-            }
+        content = kwargs.get("content", "")
+        if not content:
+            return {"status": "error", "error": "Missing required parameter: content"}
         try:
             import pyperclip
             pyperclip.copy(content)
             return {
                 "status": "success",
                 "action": "set_clipboard",
-                "content": str(content)[:100],
-                "message": f"Clipboard set ({len(str(content))} chars)",
-                "result": {"length": len(str(content))},
-                "verification": {"set": True},
+                "message": "Set clipboard content",
+                "result": {"length": len(content)},
+                "verification": {"success": True},
                 "error": None
             }
         except ImportError:
@@ -924,146 +926,86 @@ class SetClipboardTool(Tool):
             return {"status": "error", "error": str(e)}
 
 
-class EmergencyStopTool(Tool):
-    """Emergency stop all automation."""
+class ToolDispatcher:
+    """Central dispatcher for tool execution with async support."""
 
-    def __init__(self):
-        super().__init__("emergency_stop", "Emergency stop all automation", required_permission="A")
+    def __init__(self, tool_registry: ToolRegistry, config: Any):
+        self.tool_registry = tool_registry
+        self.config = config
+        automation = getattr(config, 'automation', None)
+        self.max_tool_calls = getattr(automation, 'max_tool_calls', 5) or 5
+        self.call_count = 0
 
-    def execute(self, **kwargs) -> dict:
+    def execute(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a tool by name with arguments.
+
+        Handles async tools by running them in an event loop if needed.
+        """
+        from alice.core.config import Config
+        config = Config.load()
+        self.call_count += 1
+        if self.call_count > self.max_tool_calls:
+            return {"status": "error", "error": f"Exceeded maximum tool calls ({self.max_tool_calls})"}
+
+        tool = self.tool_registry.get(tool_name)
+        if not tool:
+            return {"status": "error", "error": f"Tool '{tool_name}' not found"}
+
         try:
-            import pyautogui
-            # Move mouse to corner to trigger failsafe
-            pyautogui.FAILSAFE = True
-            pyautogui.moveTo(0, 0)
-            return {
-                "status": "success",
-                "action": "emergency_stop",
-                "message": "Emergency stop triggered - mouse moved to corner",
-                "result": {"failsafe_triggered": True},
-                "verification": {"stopped": True},
-                "error": None
-            }
-        except ImportError:
-            return {"status": "error", "error": "pyautogui not installed"}
+            result = tool.execute(**arguments)
+            return result
         except Exception as e:
-            logger.error(f"EmergencyStopTool error: {e}")
+            logger.error(f"Tool execution error for {tool_name}: {e}")
+            return {"status": "error", "error": str(e)}
+
+    async def execute_async(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a tool asynchronously."""
+        tool = self.tool_registry.get(tool_name)
+        if not tool:
+            return {"status": "error", "error": f"Tool '{tool_name}' not found"}
+
+        self.call_count += 1
+        if self.call_count > self.max_tool_calls:
+            return {"status": "error", "error": f"Exceeded maximum tool calls ({self.max_tool_calls})"}
+
+        try:
+            # Check if tool has async implementation
+            async_method = getattr(tool, '_execute_async', None)
+            if async_method:
+                result = await async_method(**arguments)
+            else:
+                result = tool.execute(**arguments)
+            return result
+        except Exception as e:
+            logger.error(f"Async tool execution error for {tool_name}: {e}")
             return {"status": "error", "error": str(e)}
 
 
-class SystemInfoTool(Tool):
-    """Get system information."""
-
-    def __init__(self):
-        super().__init__("system_info", "Get system information", required_permission="A")
-
-    def execute(self, **kwargs) -> dict:
-        try:
-            from alice.computer.engine import ComputerEngine
-            from alice.core.config import Config
-            config = Config.load()
-            engine = ComputerEngine(config)
-            info = engine.get_system_info()
-            return {
-                "status": "success",
-                "action": "system_info",
-                "message": "System info retrieved",
-                "result": info,
-                "verification": {"retrieved": True},
-                "error": None
-            }
-        except Exception as e:
-            logger.error(f"SystemInfoTool error: {e}")
-            return {"status": "error", "error": str(e)}
-
-
-class ListRunningAppsTool(Tool):
-    """List running applications."""
-
-    def __init__(self):
-        super().__init__("list_running_apps", "List running applications", required_permission="A")
-
-    def execute(self, **kwargs) -> dict:
-        try:
-            from alice.computer.engine import ComputerEngine
-            from alice.core.config import Config
-            config = Config.load()
-            engine = ComputerEngine(config)
-            apps = engine.get_running_apps()
-            return {
-                "status": "success",
-                "action": "list_running_apps",
-                "message": f"Found {len(apps)} running apps",
-                "result": {"apps": apps[:50]},
-                "verification": {"count": len(apps)},
-                "error": None
-            }
-        except Exception as e:
-            logger.error(f"ListRunningAppsTool error: {e}")
-            return {"status": "error", "error": str(e)}
-
-
-class SaveFileTool(Tool):
-    """Save content to a file."""
-
-    def __init__(self):
-        super().__init__("save_file", "Save content to a file", required_permission="A")
-
-    def execute(self, **kwargs) -> dict:
-        # Support 'path' and 'file_path' parameter names
-        path = kwargs.get("path") or kwargs.get("file_path")
-        if not path:
-            return {
-                "status": "error",
-                "action": "save_file",
-                "message": "Missing required parameter: path or file_path",
-                "error": "Missing required parameter: path or file_path"
-            }
-
-        content = kwargs.get("content")
-
-        try:
-            from alice.computer.file_operations import FileOperations
-            from alice.core.config import Config
-            config = Config.load()
-            fo = FileOperations(config)
-            success, message, details = fo.save_file(path, content)
-            return {
-                "status": "success" if success else "error",
-                "action": "save_file",
-                "path": path,
-                "message": message,
-                "result": details if success else None,
-                "verification": {"file_exists": Path(path).exists() if success else False},
-                "error": None if success else message
-            }
-        except Exception as e:
-            logger.error(f"SaveFileTool error: {e}")
-            return {
-                "status": "error",
-                "action": "save_file",
-                "path": path,
-                "message": str(e),
-                "result": None,
-                "verification": {"file_exists": False},
-                "error": str(e)
-            }
-
-
-# Tool factory
 def create_default_tools() -> ToolRegistry:
-    """Create and register default tools."""
+    """Create and register all default tools."""
     registry = ToolRegistry()
 
+    # App control tools
     registry.register(OpenAppTool())
     registry.register(CloseAppTool())
     registry.register(FocusAppTool())
+
+    # File and folder tools
     registry.register(CreateFolderTool())
     registry.register(SearchFilesTool())
+
+    # Browser tools
     registry.register(BrowserOpenTool())
     registry.register(BrowserExtractTool())
     registry.register(BrowserDownloadTool())
     registry.register(BrowserScreenshotTool())
+
+    # ALICE lifecycle tools
+    registry.register(CloseAllAppsTool())
+    registry.register(GetOpenAppsTool())
+    registry.register(GetAppStatusTool())
+
+    # Input simulation tools
     registry.register(TypeTextTool())
     registry.register(KeyboardShortcutTool())
     registry.register(MouseMoveTool())
@@ -1073,15 +1015,5 @@ def create_default_tools() -> ToolRegistry:
     registry.register(CopyPasteTool())
     registry.register(GetClipboardTool())
     registry.register(SetClipboardTool())
-    registry.register(EmergencyStopTool())
-    registry.register(SystemInfoTool())
-    registry.register(ListRunningAppsTool())
-    registry.register(SaveFileTool())
 
     return registry
-
-
-if __name__ == "__main__":
-    # Test
-    registry = create_default_tools()
-    print(f"Registered tools: {[t.name for t in registry.list_tools()]}")

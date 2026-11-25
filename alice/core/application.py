@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import time
 from typing import Any, Dict, List, Optional
 
 from alice.ai.lmstudio_adapter import LMStudioAdapter
 from alice.ai.runtime_manager import RuntimeManager
-from alice.tools.tools import create_default_tools
+from alice.tools.tools import create_default_tools, ToolDispatcher
 from alice.planner.planner import TaskPlanner
 
 logger = logging.getLogger(__name__)
@@ -25,17 +27,20 @@ class AliceApplication:
         self.ai_adapter = LMStudioAdapter(config)
         self.runtime = RuntimeManager(self.ai_adapter, config)
 
-        # Tool system
+        # Tool system with centralized dispatcher
         self.tool_registry = create_default_tools()
         self.task_planner = TaskPlanner(self.tool_registry)
+        # Central tool dispatcher - all tool execution goes through this
+        self.tool_dispatcher = ToolDispatcher(self.tool_registry, config)
 
         # Permission system
         self.automation_config = config.automation
+        self.max_tool_calls = 5  # Prevent infinite loops
+        self.current_tool_call_count = 0
 
         # System prompt that enables tool calling
         self.system_prompt = """You are ALICE, a helpful local Windows desktop assistant.
-You have access to tools for controlling the computer. When the user asks you to perform an action on their computer,
-you should use the appropriate tool by calling it.
+You have access to tools for controlling the computer. When the user asks you to perform an action on their computer, you should use the appropriate tool by calling it.
 
 Available tools:
 - open_app(app_name: string): Open an application (e.g., "notepad", "chrome", "calculator")
@@ -59,8 +64,12 @@ Available tools:
 - emergency_stop(): Emergency stop all automation
 - system_info(): Get system information
 - list_running_apps(): List running applications
+- close_all_apps(): Close all applications opened by ALICE
+- get_open_apps(): List applications opened by ALICE
+- get_app_status(app_name: string): Get status of a specific application
 
-When you need to use a tool, respond with a JSON object:
+When you need to use a tool, respond with a JSON object wrapped in markdown:
+```json
 {
   "tool_calls": [
     {
@@ -70,6 +79,7 @@ When you need to use a tool, respond with a JSON object:
     }
   ]
 }
+```
 
 Only call tools when the user explicitly requests a computer action. For normal conversation, respond normally without tool calls."""
 
@@ -104,20 +114,47 @@ Only call tools when the user explicitly requests a computer action. For normal 
         # Get response from LLM
         response = await self.runtime.chat(messages)
 
-        # Check if response contains tool calls
-        try:
-            parsed = json.loads(response)
+        # Check if response contains tool calls (handle both raw JSON and markdown-fenced)
+        parsed = self._parse_ai_response(response)
+        if parsed is not None:
             if "tool_calls" in parsed:
                 # Extract content from the AI response (may be None/empty when only tool_calls)
                 content = parsed.get("content")
                 if content is None:
                     content = ""
                 return await self._execute_tool_calls(parsed["tool_calls"], history, content)
-        except json.JSONDecodeError:
-            # Not a tool call, return as-is
-            return response
 
         return response
+
+    def _parse_ai_response(self, response: str) -> Optional[Dict[str, Any]]:
+        """Parse AI response, handling both raw JSON and markdown-fenced JSON.
+
+        AI may return:
+        - Raw JSON: {"tool_calls": [...], "content": "..."}
+        - Markdown-fenced: ```json\n{"tool_calls": [...]}\n```
+        """
+        if not response:
+            return None
+
+        response = response.strip()
+
+        # Try markdown-fenced JSON first
+        if "```json" in response or "```" in response:
+            # Extract content from markdown fences - use a more robust approach
+            # Match from opening ``` to closing ```, capturing everything in between
+            match = re.search(r'```(?:json)?\s*(.*?)\s*```', response, re.DOTALL)
+            if match:
+                content = match.group(1).strip()
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    pass
+
+        # Try raw JSON parsing
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return None
 
     def _normalize_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize tool arguments to match tool signatures.
@@ -225,13 +262,16 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     tool_results.append({
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": f"Permission denied for tool {tool_name} (category {tool.required_permission})"
+                        "content": json.dumps({
+                            "status": "error",
+                            "error": f"Permission denied for tool {tool_name} (category {tool.required_permission})"
+                        })
                     })
                     continue
 
-            # Execute tool
+            # Execute tool through dispatcher (handles async tools properly)
             if tool:
-                result = tool.execute(**arguments)
+                result = self.tool_dispatcher.execute(tool_name, arguments)
             else:
                 result = {"status": "error", "error": f"Tool {tool_name} not found"}
 

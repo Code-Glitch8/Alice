@@ -7,6 +7,7 @@ Provides file operations, application control, and system information.
 import logging
 import subprocess
 import os
+import time
 import psutil
 import winreg
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,15 +53,26 @@ class ComputerEngine:
         "services": "services.msc",
     }
 
-    def __init__(self, config: Any):
+    def __init__(self, config: Any = None):
         self.config = config
         self.running_apps: List[Dict[str, Any]] = []
+        self._app_owner = None
+        if config:
+            try:
+                from alice.core.application_owner import ApplicationOwner
+                self._app_owner = ApplicationOwner.get_instance()
+            except Exception:
+                self._app_owner = None
 
     # File operations
     def search_files(self, query: str, folder: Optional[str] = None) -> List[Dict[str, Any]]:
         """Search for files by name or extension."""
-        logger.info(f"Searching files: {query} in {folder}")
-        return []
+        from alice.computer.file_operations import FileOperations
+        from alice.core.config import Config
+
+        config = Config.load()
+        fo = FileOperations(config)
+        return fo.search_files(query, folder)
 
     def create_folder(self, path: str) -> Tuple[bool, str]:
         """Create a folder at the specified path. Returns (success, message)."""
@@ -106,9 +118,12 @@ class ComputerEngine:
             return False, str(e), results
 
     # Application control
-    def _resolve_app(self, app_name: str) -> Tuple[Optional[str], Optional[str]]:
+    def _resolve_app(self, app_name: str, target_path: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
         """Resolve an application name to an executable command and its type.
-        Returns (command, type) where type is 'exe', 'protocol', or 'msc'."""
+
+        Returns (command, type) where type is 'exe', 'protocol', 'msc', or 'explorer'.
+        For File Explorer, can optionally specify a target path.
+        """
         app_lower = app_name.lower().strip()
 
         # Check known aliases
@@ -118,7 +133,18 @@ class ComputerEngine:
                 return cmd, "msc"
             elif cmd.endswith(":"):
                 return cmd, "protocol"
+            elif cmd == "explorer.exe":
+                # Special handling for File Explorer - can open a specific folder
+                if target_path:
+                    return f'explorer.exe "{target_path}"', "explorer"
+                return cmd, "explorer"
             return cmd, "exe"
+
+        # Handle File Explorer variations
+        if "explorer" in app_lower or "file" in app_lower and "explorer" in app_lower:
+            if target_path:
+                return f'explorer.exe "{target_path}"', "explorer"
+            return "explorer.exe", "explorer"
 
         # Try to find in PATH
         try:
@@ -163,11 +189,14 @@ class ComputerEngine:
 
         return None, None
 
-    def open_app(self, app_name: str) -> Tuple[bool, str, Dict[str, Any]]:
-        """Open an application by name. Returns (success, message, details)."""
-        logger.info(f"Opening application: {app_name}")
+    def open_app(self, app_name: str, target_path: Optional[str] = None) -> Tuple[bool, str, Dict[str, Any]]:
+        """Open an application by name. Returns (success, message, details).
 
-        command, cmd_type = self._resolve_app(app_name)
+        For File Explorer, can optionally specify target_path to open a specific folder.
+        """
+        logger.info(f"Opening application: {app_name} (target: {target_path})")
+
+        command, cmd_type = self._resolve_app(app_name, target_path)
         if not command:
             return False, f"Application not found: {app_name}", {"app": app_name, "error": "not_found"}
 
@@ -179,13 +208,15 @@ class ComputerEngine:
             elif cmd_type == "msc":
                 # Handle MMC snap-ins
                 process = subprocess.Popen(["mmc", command], shell=False)
+            elif cmd_type == "explorer":
+                # Handle File Explorer - use direct shell execution
+                process = subprocess.Popen(command, shell=True)
             else:
                 # Regular executable
                 # For UWP apps like Notepad, use start command to launch properly
                 process = subprocess.Popen(["cmd", "/c", "start", "", command], shell=False)
 
             # Wait briefly to verify process started
-            import time
             time.sleep(1.0)
 
             # Check if process is still running OR if it's a UWP app that spawned a child
@@ -206,6 +237,9 @@ class ComputerEngine:
                                 "status": "running"
                             }
                             self.running_apps.append(details)
+                            # Register with ApplicationOwner if available
+                            if self._app_owner:
+                                self._app_owner.register_app(app_name, proc.info['pid'])
                             return True, f"Opened {app_name} (PID: {proc.info['pid']})", details
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         continue
@@ -227,6 +261,9 @@ class ComputerEngine:
                     "status": "running"
                 }
                 self.running_apps.append(details)
+                # Register with ApplicationOwner if available
+                if self._app_owner:
+                    self._app_owner.register_app(app_name, process.pid)
                 return True, f"Opened {app_name} (PID: {process.pid})", details
             except psutil.NoSuchProcess:
                 return False, f"Process died immediately: {app_name}", {"app": app_name, "error": "process_died"}
