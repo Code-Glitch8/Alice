@@ -321,13 +321,27 @@ class BrowserOpenTool(Tool):
         visible = kwargs.get("visible", False)  # New parameter for visible mode
         try:
             import asyncio
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                task = asyncio.ensure_future(self._browser_open_async(url, search, visible))
-                return {"status": "started", "url": url, "search": search}
-            else:
-                result = loop.run_until_complete(self._browser_open_async(url, search, visible))
+
+            # Always use run_until_complete with a new loop for synchronous execution
+            # This ensures we wait for the browser to complete before returning
+            try:
+                loop = asyncio.get_running_loop()
+                # We're in an async context, need to create a task and wait for it
+                # Use asyncio.run() for clean async execution in async context
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, self._browser_open_async(url, search, visible))
+                    result = future.result(timeout=30)  # 30 second timeout for browser operations
                 return result
+            except RuntimeError:
+                # No running loop, use standard approach
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    result = loop.run_until_complete(self._browser_open_async(url, search, visible))
+                    return result
+                finally:
+                    loop.close()
         except Exception as e:
             logger.error(f"Browser open error: {e}")
             return {"status": "error", "error": str(e)}
@@ -649,7 +663,7 @@ class GetAppStatusTool(Tool):
 
 
 class TypeTextTool(Tool):
-    """Type text into the active window."""
+    """Type text into the active window using reliable clipboard paste method."""
 
     def __init__(self):
         super().__init__("type_text", "Type text into the active window", required_permission="B")
@@ -666,33 +680,69 @@ class TypeTextTool(Tool):
         try:
             import pyautogui
             from alice.computer.engine import ComputerEngine
+            from alice.tools.clipboard_utils import set_text_to_clipboard
 
-            # Focus target window if specified
+            # Focus target window if specified or auto-detect
+            engine = ComputerEngine()
             if target_window:
-                engine = ComputerEngine()
                 success, msg = engine.focus_app(target_window)
-                if success:
-                    import time
-                    time.sleep(0.5)  # Wait for window to gain focus
+            else:
+                # Auto-focus: bring the most recently interacted app to front
+                success = engine.auto_focus_most_relevant()
+
+            # Ensure window has focus with proper wait
+            if success:
+                import time
+                time.sleep(0.3)
 
             if delay > 0:
                 import time
                 time.sleep(delay)
 
-            pyautogui.typewrite(text, interval=interval)
+            # Use clipboard paste method for reliable typing
+            # This is more reliable than pyautogui.typewrite() which can fail
+            result = set_text_to_clipboard(text, target_window=target_window)
 
+            if result.get("status") == "success":
+                # Verify focus is correct
+                verification = result.get("verification", {"success": True})
+                return {
+                    "status": "success",
+                    "action": "type_text",
+                    "text": text,
+                    "target_window": target_window,
+                    "message": f"Typed text into {'window: ' + target_window if target_window else 'active window'}",
+                    "result": {"typed": len(text), "method": "clipboard_paste"},
+                    "verification": verification,
+                    "error": None
+                }
+            else:
+                # Fallback to pyautogui if clipboard method fails
+                pyautogui.typewrite(text, interval=interval)
+                return {
+                    "status": "success",
+                    "action": "type_text",
+                    "text": text,
+                    "target_window": target_window,
+                    "message": f"Typed text into {'window: ' + target_window if target_window else 'active window'} (direct)",
+                    "result": {"typed": len(text), "method": "direct_typing"},
+                    "verification": {"success": True, "method": "direct_typing"},
+                    "error": None
+                }
+        except ImportError:
+            # Fallback to basic typing if pyautogui not available
+            import pyautogui
+            pyautogui.typewrite(text, interval=interval)
             return {
                 "status": "success",
                 "action": "type_text",
                 "text": text,
                 "target_window": target_window,
-                "message": f"Typed text into {'window: ' + target_window if target_window else 'active window'}",
+                "message": f"Typed text (pyautogui fallback) into {'window: ' + target_window if target_window else 'active window'}",
                 "result": {"typed": len(text)},
-                "verification": {"success": True},
+                "verification": {"success": True, "method": "pyautogui_fallback"},
                 "error": None
             }
-        except ImportError:
-            return {"status": "error", "error": "pyautogui not installed"}
         except Exception as e:
             logger.error(f"TypeTextTool error: {e}")
             return {"status": "error", "error": str(e)}

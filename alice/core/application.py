@@ -96,6 +96,8 @@ Only call tools when the user explicitly requests a computer action. For normal 
         Uses native tool calling when tools are provided to LM Studio.
         Falls back to parsing AI response if tool calls are returned as text/JSON.
         Integrates the task planner for compound commands.
+        Implements an iterative tool execution loop that continues until the model
+        produces a final response (not just tool calls).
         """
         if not self.initialized and not await self.initialize():
             raise RuntimeError(self.ai_adapter.last_error or "LM Studio is unavailable")
@@ -107,28 +109,98 @@ Only call tools when the user explicitly requests a computer action. For normal 
         if tools is None:
             tools = self.get_tools_for_api()
 
-        # Get response from LLM with native tool calling support
-        response = await self.runtime.chat(messages, tools=tools)
+        # Track execution rounds to prevent infinite loops
+        max_rounds = getattr(self.config, 'automation', None)
+        max_rounds = getattr(max_rounds, 'max_tool_calls', 5) if max_rounds else 5
+        round_count = 0
 
-        # Check if response contains tool calls (handle both native and fallback formats)
-        parsed = self._parse_ai_response(response)
-        if parsed is not None:
-            if "tool_calls" in parsed:
-                # Extract content from the AI response (may be None/empty when only tool_calls)
-                content = parsed.get("content")
-                if content is None:
-                    content = ""
+        # Store tool definitions to persist across rounds
+        tool_definitions = tools
 
-                tool_calls = parsed["tool_calls"]
+        while round_count < max_rounds:
+            round_count += 1
+            self.current_tool_call_count = 0  # Reset per round
 
+            # Get response from LLM with native tool calling support
+            response = await self.runtime.chat(messages, tools=tool_definitions)
+
+            # Parse response - this now handles ALL formats including XML in content
+            parsed_response = self._parse_ai_response(response)
+
+            # Extract tool calls and content from the parsed response
+            native_tool_calls = []
+            content = ""
+
+            if isinstance(parsed_response, dict):
+                # Check for tool calls from native format
+                if "tool_calls" in parsed_response:
+                    native_tool_calls = parsed_response["tool_calls"]
+                content = parsed_response.get("content") or ""
+            elif isinstance(parsed_response, str):
+                # Response was raw text - check for embedded XML calls
+                if "<function" in parsed_response:
+                    native_tool_calls = self._parse_xml_tool_calls(parsed_response)
+                    # Remove XML markup from content
+                    content = self._remove_xml_markup(parsed_response)
+                else:
+                    content = parsed_response
+
+            # If parsed_response was None or empty, use raw response
+            if not content:
+                content = self._remove_xml_markup(response) if "<function" in response else response
+
+            # Build combined tool calls list
+            all_tool_calls = []
+            processed_ids = set()
+
+            # Add XML tool calls first (they have generated IDs)
+            for tc in native_tool_calls:
+                tc_id = tc.get("id", f"xml_{len(all_tool_calls)}")
+                if tc_id not in processed_ids:
+                    all_tool_calls.append(tc)
+                    processed_ids.add(tc_id)
+
+            if all_tool_calls:
                 # Detect if this is a compound command that should use the planner
-                if self._is_compound_command(content, tool_calls):
+                if self._is_compound_command(content, all_tool_calls):
                     # Use planner for compound commands
-                    return await self._execute_planned_tasks(history, content, tool_calls)
+                    return await self._execute_planned_tasks(history, content, all_tool_calls)
 
-                return await self._execute_tool_calls(tool_calls, history, content)
+                # Execute tool calls and get result
+                result = await self._execute_tool_calls(all_tool_calls, messages, content)
 
-        return response
+                # Build messages for next iteration
+                assistant_msg = {"role": "assistant", "content": content}
+                if all_tool_calls:
+                    assistant_msg["tool_calls"] = all_tool_calls
+                messages.append(assistant_msg)
+
+                if isinstance(result, list):
+                    messages.extend(result)
+                elif result:
+                    messages.append({"role": "assistant", "content": str(result)})
+
+                # Check if we got a string result (means final response)
+                if isinstance(result, str):
+                    return result
+
+                # Continue loop for next iteration
+            else:
+                # No tool calls found - this is our final response
+                # Content should be clean (no XML markup)
+                return content if content else "Task completed."
+
+    def _remove_xml_markup(self, content: str) -> str:
+        """Remove XML-style tool call markup from content."""
+        import re
+        # Remove <function...>...</function> blocks
+        content = re.sub(r'<function[^>]*>.*?</function>', '', content, flags=re.DOTALL)
+        # Clean up artifacts like \n and ```
+        content = re.sub(r'\\n\s*\n?', '', content)
+        content = content.strip()
+        # Remove empty code block markers
+        content = re.sub(r'```\s*```', '', content)
+        return content.strip()
 
     def _is_compound_command(self, content: str, tool_calls: List[Dict]) -> bool:
         """Detect if this is a compound command that needs planning.
@@ -230,24 +302,88 @@ Only call tools when the user explicitly requests a computer action. For normal 
         - has_tool_calls format from LM Studio
 
         Also handles the new format from LM Studio with has_tool_calls flag.
+        When tool_calls array is empty but content contains XML, extracts XML calls.
+        Normalizes dict arguments to JSON strings for consistency.
         """
         if not response:
             return None
 
         response = response.strip()
 
-        # Check for XML-style tool calls first (Qwen format)
+        # Try raw JSON parsing first (handles has_tool_calls format)
+        json_result = None
+        try:
+            json_result = json.loads(response)
+        except json.JSONDecodeError:
+            pass
+
+        if json_result is not None:
+            # Check for has_tool_calls format from LM Studio
+            if json_result.get("has_tool_calls") or "tool_calls" in json_result:
+                parsed = json_result
+                tool_calls = parsed.get("tool_calls", [])
+                content = parsed.get("content")
+
+                # Normalize dict arguments to JSON strings
+                normalized_tool_calls = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict) and "function" in tc:
+                        func = tc.get("function", {})
+                        args = func.get("arguments", {})
+                        # Normalize args to JSON string if it's a dict
+                        if isinstance(args, dict):
+                            args = json.dumps(args, ensure_ascii=False)
+                        normalized_tool_calls.append({
+                            "id": tc.get("id"),
+                            "type": tc.get("type", "function"),
+                            "function": {
+                                "name": func.get("name"),
+                                "arguments": args
+                            }
+                        })
+                tool_calls = normalized_tool_calls
+
+                result = {
+                    "tool_calls": tool_calls,
+                    "content": content
+                }
+
+                # If tool_calls is empty but content contains XML, extract XML calls
+                if not tool_calls and content and isinstance(content, str):
+                    xml_calls = self._parse_xml_tool_calls(content)
+                    if xml_calls:
+                        # Extract clean content (without XML markup)
+                        clean_content = self._remove_xml_markup(content)
+                        result["tool_calls"] = xml_calls
+                        result["content"] = clean_content
+
+                return result
+
+            # JSON response without tool_calls - check if content contains XML
+            content = json_result.get("content", "")
+            if content and isinstance(content, str) and "<function" in content:
+                xml_calls = self._parse_xml_tool_calls(content)
+                if xml_calls:
+                    clean_content = self._remove_xml_markup(content)
+                    return {
+                        "tool_calls": xml_calls,
+                        "content": clean_content
+                    }
+
+            return json_result
+
+        # Check for XML-style tool calls in raw response (Qwen format)
         xml_tool_calls = self._parse_xml_tool_calls(response)
         if xml_tool_calls:
+            # Extract content text (without XML markup) if present
+            content = self._remove_xml_markup(response)
             return {
                 "tool_calls": xml_tool_calls,
-                "content": ""
+                "content": content
             }
 
-        # Try markdown-fenced JSON first
+        # Try markdown-fenced JSON
         if "```json" in response or "```" in response:
-            # Extract content from markdown fences - use a more robust approach
-            # Match from opening ``` to closing ```, capturing everything in between
             match = re.search(r'```(?:json)?\s*(.*?)\s*```', response, re.DOTALL)
             if match:
                 content = match.group(1).strip()
@@ -256,18 +392,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 except json.JSONDecodeError:
                     pass
 
-        # Try raw JSON parsing
-        try:
-            parsed = json.loads(response)
-            # Check for new format with has_tool_calls flag
-            if parsed.get("has_tool_calls") and parsed.get("tool_calls"):
-                return {
-                    "tool_calls": parsed.get("tool_calls", []),
-                    "content": parsed.get("content")
-                }
-            return parsed
-        except json.JSONDecodeError:
-            return None
+        return None
 
     def _parse_xml_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """Parse XML-style tool calls from Qwen model.

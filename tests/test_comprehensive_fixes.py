@@ -268,6 +268,7 @@ class TestToolExecutionLoop(unittest.TestCase):
         mock_config.automation.auto_confirm_category_a = True
         mock_config.automation.require_confirm_category_b = False
         mock_config.automation.restricted_category_c = False
+        mock_config.automation.max_tool_calls = 5  # Must be set to an integer
 
         with patch.object(LMStudioAdapter, '_request', return_value={}):
             app = AliceApplication(mock_config)
