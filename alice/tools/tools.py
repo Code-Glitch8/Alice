@@ -129,6 +129,11 @@ class CloseAppTool(Tool):
                 "verification": {"processes_closed": 0},
                 "error": "Missing required parameter: app_name or app"
             }
+        # Chrome launched by ALICE uses a dedicated persistent profile. Never
+        # terminate the user's unrelated default-profile Chrome windows.
+        if str(app_name).strip().lower() in {"chrome", "google chrome"}:
+            return BrowserOpenTool.close_owned_browser()
+
         try:
             from alice.computer.engine import ComputerEngine
             from alice.core.config import Config
@@ -305,13 +310,25 @@ class SearchFilesTool(Tool):
 
 
 class BrowserOpenTool(Tool):
-    """Open a search or URL in the user's installed Google Chrome browser."""
+    """Open a search or URL in ALICE's persistent, non-Incognito Chrome profile."""
+
+    _managed_profile_dir: Optional[str] = None
 
     def __init__(self):
         super().__init__("browser_open", "Open Google Chrome or perform a web search", required_permission="A")
 
+    @classmethod
+    def _resolve_profile_dir(cls) -> Path:
+        """Return a persistent profile directory reserved exclusively for ALICE."""
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            root = Path(local_app_data)
+        else:
+            root = Path.home() / "AppData" / "Local"
+        return root / "ALICE" / "ChromeProfile"
+
     def _find_chrome_executable(self) -> Optional[str]:
-        """Find Chrome without launching a temporary Playwright profile."""
+        """Find the installed Chrome executable."""
         candidates = []
         for root_var, suffix in (
             ("PROGRAMFILES", r"Google\Chrome\Application\chrome.exe"),
@@ -328,7 +345,7 @@ class BrowserOpenTool(Tool):
         return shutil.which("chrome.exe") or shutil.which("chrome")
 
     def _launch_chrome(self, url: Optional[str] = None, search: Optional[str] = None) -> dict:
-        """Ask installed Chrome to open a URL using its ordinary user profile."""
+        """Open Chrome with ALICE's separate, persistent regular browser profile."""
         from urllib.parse import urlencode, urlparse
 
         if search and not url:
@@ -351,7 +368,10 @@ class BrowserOpenTool(Tool):
                 "error": "Google Chrome was not found. Install Chrome or add chrome.exe to PATH."
             }
 
+        profile_dir = self._resolve_profile_dir()
         try:
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            type(self)._managed_profile_dir = str(profile_dir.resolve())
             creation_flags = (
                 getattr(subprocess, "DETACHED_PROCESS", 0)
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -365,20 +385,30 @@ class BrowserOpenTool(Tool):
             if creation_flags:
                 launch_kwargs["creationflags"] = creation_flags
 
-            # No --incognito or --user-data-dir flags: Chrome uses its normal
-            # installed profile. ALICE never terminates the user's browser.
-            process = subprocess.Popen([chrome_path, target_url], **launch_kwargs)
+            # This profile is stored under LocalAppData and reused between ALICE
+            # sessions. It is a normal Chrome profile, not an Incognito session.
+            # It is separate so that ALICE can close only its own Chrome windows.
+            command = [
+                chrome_path,
+                f"--user-data-dir={profile_dir}",
+                "--new-window",
+                "--no-first-run",
+                target_url
+            ]
+            process = subprocess.Popen(command, **launch_kwargs)
             return {
                 "status": "success",
                 "action": "browser_open",
                 "browser": "Google Chrome",
                 "search": search,
                 "url": target_url,
-                "message": "Sent the URL to Google Chrome using its normal browsing profile. Chrome stays open for you to use.",
+                "profile": str(profile_dir),
+                "message": "Opened Google Chrome in ALICE's persistent regular profile (not Incognito). Future searches reuse this profile.",
                 "verification": {
                     "launch_requested": True,
                     "incognito": False,
-                    "default_profile": True,
+                    "dedicated_profile": True,
+                    "profile_dir": str(profile_dir),
                     "pid": getattr(process, "pid", None)
                 },
                 "error": None
@@ -387,8 +417,72 @@ class BrowserOpenTool(Tool):
             logger.exception("Could not launch Google Chrome")
             return {"status": "error", "action": "browser_open", "url": target_url, "error": str(exc)}
 
+    @classmethod
+    def close_owned_browser(cls) -> dict:
+        """Close only Chrome processes using ALICE's dedicated profile."""
+        profile_dir = cls._managed_profile_dir or str(cls._resolve_profile_dir())
+        target_profile = os.path.normcase(os.path.abspath(profile_dir))
+        try:
+            import psutil
+            matches = []
+            for process in psutil.process_iter(["name", "cmdline"]):
+                try:
+                    name = (process.info.get("name") or "").lower()
+                    if "chrome" not in name:
+                        continue
+                    command_line = process.info.get("cmdline") or []
+                    for argument in command_line:
+                        if not isinstance(argument, str) or not argument.lower().startswith("--user-data-dir="):
+                            continue
+                        candidate = argument.split("=", 1)[1].strip('"')
+                        if os.path.normcase(os.path.abspath(candidate)) == target_profile:
+                            matches.append(process)
+                            break
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+
+            if not matches:
+                return {
+                    "status": "not_running",
+                    "action": "close_app",
+                    "app": "chrome",
+                    "message": "No ALICE-managed Chrome session is running. Other Chrome windows were left untouched.",
+                    "verification": {"closed_processes": 0}
+                }
+
+            for process in matches:
+                try:
+                    process.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            gone, alive = psutil.wait_procs(matches, timeout=4)
+            for process in alive:
+                try:
+                    process.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            cls._managed_profile_dir = None
+            return {
+                "status": "success",
+                "action": "close_app",
+                "app": "chrome",
+                "message": f"Closed the ALICE-managed Chrome profile ({len(gone) + len(alive)} process(es)). Other Chrome profiles were left untouched.",
+                "verification": {"closed_processes": len(gone) + len(alive)}
+            }
+        except ImportError:
+            return {
+                "status": "error",
+                "action": "close_app",
+                "app": "chrome",
+                "error": "psutil is required to safely close only the ALICE-managed Chrome profile."
+            }
+        except Exception as exc:
+            logger.exception("Could not close the ALICE-managed Chrome profile")
+            return {"status": "error", "action": "close_app", "app": "chrome", "error": str(exc)}
+
     def execute(self, **kwargs) -> dict:
-        """Launch Chrome visibly; browser lifetime is independent of this call."""
+        """Launch Chrome visibly; the persistent browser profile outlives this call."""
         return self._launch_chrome(kwargs.get("url"), kwargs.get("search"))
 
     async def _browser_open_async(self, url: Optional[str] = None, search: Optional[str] = None, visible: bool = True) -> dict:
