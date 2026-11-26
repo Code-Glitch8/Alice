@@ -79,9 +79,14 @@ class TaskPlanner:
             "all installed programs", "applications on my pc", "apps on my pc",
         )):
             steps = [TaskStep(1, "List installed applications", "list_installed_apps", {})]
-        elif any(phrase in intent_lower for phrase in ("where is ", "locate ", "find ", "look for ", "search for ")):
+        elif "search the web for " in intent_lower or "search web for " in intent_lower:
+            steps = self._plan_browser_search(user_intent)
+        elif (
+            any(phrase in intent_lower for phrase in ("where is ", "locate ", "find ", "look for "))
+            or ("search for " in intent_lower and any(word in intent_lower for word in ("folder", "directory", "file", "path")))
+        ):
             steps = self._plan_search_files(user_intent)
-        elif "search for " in intent_lower or "search the web for " in intent_lower or "search web for " in intent_lower:
+        elif "search for " in intent_lower:
             steps = self._plan_browser_search(user_intent)
         elif "download " in intent_lower:
             steps = self._plan_browser_download(user_intent)
@@ -141,23 +146,43 @@ class TaskPlanner:
         app_name = self._extract_app_name(intent)
         steps = [TaskStep(1, f"Open {app_name}", "open_app", {"app_name": app_name})]
 
-        # Accept quoted and plain-language typing/writing requests. Preserve the
-        # whole unquoted phrase until a trailing "save as" clause, when present.
-        text = None
-        write_match = re.search(
-            r"\b(?:type|write|enter)\s+(?:\"([^\"]+)\"|'([^']+)'|(.+?))(?=\s*(?:,?\s*(?:and\s+)?save\s+as\b|$))",
-            intent,
-            flags=re.IGNORECASE | re.DOTALL
+        # Distinguish literal text supplied by the user from a request to
+        # compose content. Never paste the instruction itself as the document.
+        note_match = re.search(
+            r"\\b(?:write|create|make)\\s+(?:a\\s+)?short\\s+(?:note|paragraph)\\s+(?:on|about)\\s+(.+?)(?:[.!?]?$)",
+            intent, flags=re.IGNORECASE
         )
-        if write_match:
-            text = next((part for part in write_match.groups() if part is not None), "").strip()
-            text = text.rstrip(" .!?")
+        write_match = re.search(
+            r"\\b(?:type|write|enter)\\s+(?:exactly\\s+)?(?:\\"([^\\"]+)\\"|'([^']+)'|(.+?))(?=\\s*(?:,?\\s*(?:and\\s+)?save\\s+as\\b|$))",
+            intent, flags=re.IGNORECASE | re.DOTALL
+        )
+        if note_match:
+            topic = note_match.group(1).strip().rstrip(" .!?")
+            steps.append(TaskStep(2, f"Focus {app_name}", "focus_app", {"app_name": app_name}))
+            if "notepad" in app_name.lower():
+                steps.append(TaskStep(3, "Open a new blank Notepad document", "keyboard_shortcut", {"keys": "ctrl+n"}))
+            steps.append(TaskStep(
+                len(steps) + 1, f"Write a short note about {topic}", "type_text",
+                {"generate_topic": topic, "target_window": app_name}
+            ))
+            text = None
+        elif write_match:
+            quoted = write_match.group(1) or write_match.group(2)
+            unquoted = write_match.group(3)
+            # Unquoted prose is an instruction to compose, not necessarily
+            # literal text. Only paste unquoted content when user says "type exactly".
+            if quoted is not None:
+                text = quoted.strip()
+            elif unquoted and re.match(r"\\s*exactly\\s+", unquoted, re.IGNORECASE):
+                text = re.sub(r"^\\s*exactly\\s+", "", unquoted, flags=re.IGNORECASE).strip()
+            else:
+                text = None
             if text:
+                steps.append(TaskStep(2, f"Focus {app_name}", "focus_app", {"app_name": app_name}))
+                if "notepad" in app_name.lower():
+                    steps.append(TaskStep(3, "Open a new blank Notepad document", "keyboard_shortcut", {"keys": "ctrl+n"}))
                 steps.append(TaskStep(
-                    2, f"Focus {app_name}", "focus_app", {"app_name": app_name}
-                ))
-                steps.append(TaskStep(
-                    3, f"Write text in {app_name}", "type_text",
+                    len(steps) + 1, f"Write supplied text in {app_name}", "type_text",
                     {"text": text, "target_window": app_name}
                 ))
 
@@ -230,15 +255,17 @@ class TaskPlanner:
         return steps
 
     def _plan_search_files(self, intent: str) -> List[TaskStep]:
-        """Extract a filename/folder query and optional allowed-folder scope."""
+        """Extract a filename/folder query and optional known-folder scope."""
         import re
         from alice.core.config import get_windows_known_folder
 
         match = re.search(
-            r"(?:where is|locate|find|look for|search for)\\s+(?:the\\s+)?(.+?)(?:\\s+(?:folder|directory|file))?\\s*$",
+            r"(?:where is|locate|find|look for|search for)\\s+(?:the\\s+)?(.+?)\\s*$",
             intent, flags=re.IGNORECASE
         )
-        query = match.group(1).strip().strip("\\\"'") if match else intent.strip()
+        query = match.group(1).strip() if match else intent.strip()
+        query = re.sub(r"\\s+(?:folder|directory|file)$", "", query, flags=re.IGNORECASE).strip()
+        query = query.strip("\\\"'").strip()
         folder = None
         lowered = intent.lower()
         for label in ("desktop", "documents", "downloads"):
