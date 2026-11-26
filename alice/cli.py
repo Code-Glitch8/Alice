@@ -30,7 +30,7 @@ async def run_check(app: AliceApplication) -> int:
 async def _confirm_category_b_action(tool_name: str, description: str) -> bool:
     """Ask the local CLI user before a Category B desktop action."""
     prompt = (
-        f"\\nALICE is asking permission to: {description} "
+        f"\nALICE is asking permission to: {description} "
         f"(tool: {tool_name}).\nAllow this action? [y/N] "
     )
     answer = await asyncio.to_thread(input, prompt)
