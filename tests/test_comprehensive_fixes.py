@@ -17,7 +17,7 @@ Tests all 14 root cause fixes:
 import json
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch, AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from alice.core.application import AliceApplication
 from alice.ai.lmstudio_adapter import LMStudioAdapter
