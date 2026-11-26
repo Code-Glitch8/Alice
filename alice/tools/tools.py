@@ -662,89 +662,65 @@ class GetAppStatusTool(Tool):
 
 
 class TypeTextTool(Tool):
-    """Type text into the active window using reliable clipboard paste method."""
+    """Paste text into a deliberately focused target window."""
 
     def __init__(self):
         super().__init__("type_text", "Type text into the active window", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
         text = kwargs.get("text", "")
-        delay = kwargs.get("delay", 0)
+        delay = max(0.0, float(kwargs.get("delay", 0) or 0))
         target_window = kwargs.get("target_window")
-        interval = kwargs.get("interval", 0)
-
-        if not text:
-            return {"status": "error", "error": "Missing required parameter: text"}
+        if not isinstance(text, str) or not text:
+            return {"status": "error", "action": "type_text", "error": "Missing required parameter: text"}
 
         try:
-            import pyautogui
+            import time
             from alice.computer.engine import ComputerEngine
             from alice.tools.clipboard_utils import set_text_to_clipboard
 
-            # Focus target window if specified or auto-detect
             engine = ComputerEngine()
             if target_window:
-                success, msg = engine.focus_app(target_window)
+                focused, focus_message = engine.focus_app(str(target_window))
             else:
-                # Auto-focus: bring the most recently interacted app to front
-                success = engine.auto_focus_most_relevant()
+                focused = engine.auto_focus_most_relevant()
+                focus_message = "Focused the most recently relevant application" if focused else "No target window could be focused"
 
-            # Ensure window has focus with proper wait
-            if success:
-                import time
-                time.sleep(0.3)
+            # Never paste into an arbitrary foreground window after a failed focus.
+            if not focused:
+                return {
+                    "status": "error",
+                    "action": "type_text",
+                    "target_window": target_window,
+                    "message": focus_message,
+                    "error": f"Could not focus the requested target window: {target_window or 'active application'}"
+                }
 
-            if delay > 0:
-                import time
-                time.sleep(delay)
-
-            # Use clipboard paste method for reliable typing
-            # This is more reliable than pyautogui.typewrite() which can fail
+            time.sleep(max(0.3, delay))
             result = set_text_to_clipboard(text, target_window=target_window)
+            if result.get("status") != "success":
+                return {
+                    "status": "error",
+                    "action": "type_text",
+                    "target_window": target_window,
+                    "message": "Text was not pasted.",
+                    "error": result.get("error", "Clipboard paste failed")
+                }
 
-            if result.get("status") == "success":
-                # Verify focus is correct
-                verification = result.get("verification", {"success": True})
-                return {
-                    "status": "success",
-                    "action": "type_text",
-                    "text": text,
-                    "target_window": target_window,
-                    "message": f"Typed text into {'window: ' + target_window if target_window else 'active window'}",
-                    "result": {"typed": len(text), "method": "clipboard_paste"},
-                    "verification": verification,
-                    "error": None
-                }
-            else:
-                # Fallback to pyautogui if clipboard method fails
-                pyautogui.typewrite(text, interval=interval)
-                return {
-                    "status": "success",
-                    "action": "type_text",
-                    "text": text,
-                    "target_window": target_window,
-                    "message": f"Typed text into {'window: ' + target_window if target_window else 'active window'} (direct)",
-                    "result": {"typed": len(text), "method": "direct_typing"},
-                    "verification": {"success": True, "method": "direct_typing"},
-                    "error": None
-                }
-        except ImportError:
-            # Fallback to basic typing if pyautogui not available
-            import pyautogui
-            pyautogui.typewrite(text, interval=interval)
             return {
                 "status": "success",
                 "action": "type_text",
-                "text": text,
                 "target_window": target_window,
-                "message": f"Typed text (pyautogui fallback) into {'window: ' + target_window if target_window else 'active window'}",
-                "result": {"typed": len(text)},
-                "verification": {"success": True, "method": "pyautogui_fallback"},
+                "message": f"Sent the paste shortcut to the focused window{': ' + str(target_window) if target_window else ''}.",
+                "result": {"characters": len(text), "method": "clipboard_paste"},
+                "verification": {"focus_confirmed": True, "paste_shortcut_sent": True},
                 "error": None
             }
-        except Exception as e:
-            logger.error(f"TypeTextTool error: {e}")
-            return {"status": "error", "error": str(e)}
+        except ImportError as exc:
+            return {"status": "error", "action": "type_text", "error": f"Missing automation dependency: {exc}"}
+        except Exception as exc:
+            logger.exception("TypeTextTool error")
+            return {"status": "error", "action": "type_text", "error": str(exc)}
 
 
 class KeyboardShortcutTool(Tool):
