@@ -121,10 +121,10 @@ class ComputerAccessManager:
         candidate = _resolved(path)
         protected = []
         if os.name == "nt":
-            system_root = Path(os.environ.get("WINDIR", r"C:\\Windows"))
-            program_files = Path(os.environ.get("ProgramFiles", r"C:\\Program Files"))
-            program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\\Program Files (x86)"))
-            program_data = Path(os.environ.get("PROGRAMDATA", r"C:\\ProgramData"))
+            system_root = Path(os.environ.get("WINDIR", r"C:\Windows"))
+            program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+            program_data = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
             protected.extend([system_root, program_files, program_files_x86, program_data])
         # A drive root itself is never a valid destructive target.
         if candidate == Path(candidate.anchor):
@@ -144,7 +144,7 @@ class ComputerAccessManager:
                 "move_and_organize": bool(getattr(self.settings, "allow_move_files", True)),
                 "control_applications": bool(getattr(self.settings, "allow_app_control", True)),
                 "delete_files": bool(getattr(self.settings, "allow_delete_files", True)),
-                "confirm_destructive_actions": bool(getattr(self.settings, "require_confirmation_for_destructive", True)),
+                "confirm_destructive_actions": True,
             },
             "elevation": "not_requested",
         }
