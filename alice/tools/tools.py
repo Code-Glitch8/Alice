@@ -1461,6 +1461,9 @@ class WriteFileTool(Tool):
                 return {"status": "blocked", "action": "write_file", "path": str(resolved_path),
                         "error": f"Path is outside ALICE's enabled computer-access scope: {resolved_path}"}
             exists = resolved_path.exists()
+            if exists and access.protected_destructive_path(resolved_path):
+                return {"status": "blocked", "action": "write_file", "path": str(resolved_path),
+                        "error": "Refusing to overwrite a protected Windows system file."}
             permission = "edit_files" if exists else "create_files_folders"
             setting = "allow_edit_files" if exists else "allow_create_files_folders"
             if not bool(getattr(config.automation, setting, True)):
