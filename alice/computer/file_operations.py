@@ -241,8 +241,8 @@ class FileOperations:
             destination = Path(dst).expanduser().resolve()
             if not source.exists():
                 return False, f"Source not found: {source}", {"source": str(source)}
-            if manager.protected_destructive_path(source):
-                return False, f"Refusing to move a protected system location: {source}", {"source": str(source)}
+            if manager.protected_destructive_path(source) or manager.protected_destructive_path(destination):
+                return False, "Refusing to move from or into a protected system location.", {"source": str(source), "destination": str(destination)}
             if destination.exists():
                 return False, f"Destination already exists; refusing to overwrite: {destination}", {"destination": str(destination)}
             destination.parent.mkdir(parents=True, exist_ok=True)
