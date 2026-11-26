@@ -73,11 +73,12 @@ class ComputerAccessManager:
 
     def permission_enabled(self, action: str) -> bool:
         mapping = {
-            "search_files": "search_all_drives",
+            # Turning off all-drive discovery narrows search to configured
+            # folders; it does not disable ordinary file search.
+            "search_files": "allow_read_files",
             "list_drives": "search_all_drives",
             "read_file": "allow_read_files",
             "create_folder": "allow_create_files_folders",
-            "write_file": "allow_create_files_folders",
             "move_file": "allow_move_files",
             "rename_file": "allow_move_files",
             "delete_file": "allow_delete_files",
@@ -95,6 +96,11 @@ class ComputerAccessManager:
             "select_text": "allow_app_control",
             "copy_paste": "allow_app_control",
         }
+        if action == "write_file":
+            return bool(
+                getattr(self.settings, "allow_create_files_folders", True)
+                or getattr(self.settings, "allow_edit_files", True)
+            )
         field = mapping.get(action)
         return bool(getattr(self.settings, field, True)) if field else True
 
