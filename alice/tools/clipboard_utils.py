@@ -73,12 +73,12 @@ def set_text_to_clipboard(text: str, target_window: Optional[str] = None) -> Dic
 
         # Clear any previous clipboard content indicator
         pyperclip.copy("")
+        clipboard_was_modified = True
         time.sleep(0.1)
 
-        # Set the actual text. Mark it modified immediately so the finally
-        # block restores even when sending Ctrl+V raises an exception.
+        # Replace the temporary clipboard value. The finally block restores
+        # the original content even if this copy or the paste shortcut fails.
         pyperclip.copy(text)
-        clipboard_was_modified = True
         time.sleep(0.1)  # Small delay to ensure clipboard is updated
 
         # Focus target window if specified
