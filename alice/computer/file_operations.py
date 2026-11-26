@@ -233,16 +233,22 @@ class FileOperations:
         try:
             from alice.core.access_manager import ComputerAccessManager
             manager = ComputerAccessManager(self.config)
-            for candidate in (src, dst):
-                allowed, reason = manager.validate_path(candidate)
-                if not allowed:
-                    return False, reason, {"source": str(src), "destination": str(dst)}
             source = Path(src).expanduser().resolve()
             destination = Path(dst).expanduser().resolve()
             if not source.exists():
                 return False, f"Source not found: {source}", {"source": str(source)}
+            # A directory destination means "move into this folder", preserving
+            # the source name. An existing file is never overwritten.
+            if destination.exists() and destination.is_dir():
+                destination = destination / source.name
+            for candidate in (source, destination):
+                allowed, reason = manager.validate_path(candidate)
+                if not allowed:
+                    return False, reason, {"source": str(source), "destination": str(destination)}
             if manager.protected_destructive_path(source) or manager.protected_destructive_path(destination):
                 return False, "Refusing to move from or into a protected system location.", {"source": str(source), "destination": str(destination)}
+            if source.is_dir() and is_within(destination, source):
+                return False, "Cannot move a folder into itself or one of its descendants.", {"source": str(source), "destination": str(destination)}
             if destination.exists():
                 return False, f"Destination already exists; refusing to overwrite: {destination}", {"destination": str(destination)}
             destination.parent.mkdir(parents=True, exist_ok=True)
