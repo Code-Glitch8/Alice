@@ -29,7 +29,7 @@ def test_search_accepts_nested_folder_inside_allowed_root(tmp_path):
     (nested / "target.txt").write_text("ok", encoding="utf-8")
 
     config = SimpleNamespace(
-        automation=SimpleNamespace(allowed_locations=[str(tmp_path)])
+        automation=SimpleNamespace(allowed_locations=[str(tmp_path)], search_all_drives=False)
     )
     results = FileOperations(config).search_files("target", str(nested))
 
