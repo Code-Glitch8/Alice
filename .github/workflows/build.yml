@@ -1,5 +1,10 @@
 name: ALICE Build
 
+# Cancel superseded PR builds so only the newest ALICE revision consumes runners.
+concurrency:
+  group: alice-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main, develop]
