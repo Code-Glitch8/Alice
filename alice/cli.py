@@ -27,7 +27,21 @@ async def run_check(app: AliceApplication) -> int:
     return 0
 
 
+async def _confirm_category_b_action(tool_name: str, description: str) -> bool:
+    """Ask the local CLI user before a Category B desktop action."""
+    prompt = (
+        f"\\nALICE is asking permission to: {description} "
+        f"(tool: {tool_name}).\\nAllow this action? [y/N] "
+    )
+    answer = await asyncio.to_thread(input, prompt)
+    approved = answer.strip().lower() in {"y", "yes"}
+    if not approved:
+        print("Permission not granted. ALICE will not perform that action.")
+    return approved
+
+
 async def run_chat(app: AliceApplication, model: str | None) -> int:
+    app.permission_confirmation_callback = _confirm_category_b_action
     if not await app.initialize():
         print(f"Could not connect to LM Studio: {app.ai_adapter.last_error}", file=sys.stderr)
         return 2
