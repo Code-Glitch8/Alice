@@ -16,7 +16,7 @@ def test_search_finds_hidden_cache_directories(tmp_path):
     (cache / "README.md").write_text("cache", encoding="utf-8")
 
     config = SimpleNamespace(
-        automation=SimpleNamespace(allowed_locations=[str(tmp_path)])
+        automation=SimpleNamespace(allowed_locations=[str(tmp_path)], search_all_drives=False)
     )
     results = FileOperations(config).search_files(".pytest_cache")
 
@@ -44,7 +44,7 @@ def test_search_rejects_folder_outside_allowed_roots(tmp_path):
     (outside / "secret.txt").write_text("no", encoding="utf-8")
 
     config = SimpleNamespace(
-        automation=SimpleNamespace(allowed_locations=[str(allowed)])
+        automation=SimpleNamespace(allowed_locations=[str(allowed)], search_all_drives=False)
     )
     assert FileOperations(config).search_files("secret", str(outside)) == []
 
