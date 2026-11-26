@@ -175,9 +175,10 @@ def test_dispatcher_limit_is_scoped_to_each_user_turn():
     assert app.tool_dispatcher.execute_async.await_count == 2
 
 
-def test_chrome_uses_default_profile_and_url_encodes_search():
+def test_chrome_uses_persistent_dedicated_profile_and_encodes_search(monkeypatch, tmp_path):
     tool = BrowserOpenTool()
     tool._find_chrome_executable = lambda: r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
 
     with patch("alice.tools.tools.subprocess.Popen") as popen:
         popen.return_value.pid = 9876
@@ -185,12 +186,49 @@ def test_chrome_uses_default_profile_and_url_encodes_search():
 
     assert result["status"] == "success"
     assert result["verification"]["launch_requested"] is True
-    assert result["verification"]["default_profile"] is True
+    assert result["verification"]["dedicated_profile"] is True
     assert result["verification"]["incognito"] is False
     command = popen.call_args.args[0]
-    assert command[1] == "https://www.google.com/search?q=Google+ai+studio"
+    assert command[1].startswith("--user-data-dir=")
+    assert command[1].endswith("ALICE/ChromeProfile") or command[1].endswith("ALICE\\ChromeProfile")
+    assert command[-1] == "https://www.google.com/search?q=Google+ai+studio"
     assert not any("incognito" in str(arg).lower() for arg in command)
-    assert not any("user-data-dir" in str(arg).lower() for arg in command)
+    assert not any("--user-data-dir" in str(arg).lower() and "alice" not in str(arg).lower() for arg in command)
+
+
+
+def test_close_chrome_only_targets_alice_dedicated_profile(monkeypatch, tmp_path):
+    import psutil
+    from unittest.mock import MagicMock
+
+    profile = tmp_path / "ALICE" / "ChromeProfile"
+    monkeypatch.setattr(BrowserOpenTool, "_managed_profile_dir", str(profile))
+    alice_process = MagicMock()
+    alice_process.info = {
+        "name": "chrome.exe",
+        "cmdline": ["chrome.exe", f"--user-data-dir={profile}", "--type=browser"],
+    }
+    other_process = MagicMock()
+    other_process.info = {
+        "name": "chrome.exe",
+        "cmdline": ["chrome.exe", r"--user-data-dir=C:\\Users\\Student\\AppData\\Local\\Google\\Chrome\\User Data"],
+    }
+
+    with patch("psutil.process_iter", return_value=[alice_process, other_process]), \
+         patch("psutil.wait_procs", return_value=([alice_process], [])):
+        result = BrowserOpenTool.close_owned_browser()
+
+    assert result["status"] == "success"
+    alice_process.terminate.assert_called_once()
+    other_process.terminate.assert_not_called()
+
+
+def test_planner_maps_explicit_close_chrome_to_owned_close_tool():
+    steps = TaskPlanner(None).plan("close Chrome")
+    assert len(steps) == 1
+    assert steps[0].tool_name == "close_app"
+    assert steps[0].parameters == {"app_name": "chrome"}
+
 
 
 def test_chrome_launcher_does_not_claim_success_when_not_installed():
