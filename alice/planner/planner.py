@@ -82,6 +82,11 @@ class TaskPlanner:
             steps = self._plan_browser_extract(user_intent)
         elif any(kw in intent_lower for kw in ["close ", "quit ", "exit "]):
             steps = self._plan_close_app(user_intent)
+        elif any(kw in intent_lower for kw in ["open", "launch", "start"]) and "chrome" in intent_lower:
+            steps = [TaskStep(
+                1, "Open Google Chrome", "browser_open",
+                {"url": "https://www.google.com/", "visible": True}
+            )]
         elif any(kw in intent_lower for kw in ["open", "launch", "start"]):
             steps = self._plan_open_app(user_intent)
         elif any(kw in intent_lower for kw in ["browser", "search chrome", "search web"]):
