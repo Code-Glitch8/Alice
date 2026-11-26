@@ -25,58 +25,92 @@ class FileOperations:
 
     # Search operations
     def search_files(self, query: str, folder: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Search for files by name or extension within a folder.
+        """Search allowed folders for matching files and directories.
 
-        If no folder is specified, searches across all allowed locations.
+        A supplied folder may be any descendant of an allowed root. Directory
+        names (including hidden folders such as .pytest_cache) are searchable.
         """
-        results = []
-        query_lower = query.lower()
+        query = str(query or "").strip()
+        if not query:
+            return []
+        query_lower = query.casefold()
+        results: List[Dict[str, Any]] = []
 
-        # Determine search locations: specific folder or all allowed locations
-        if folder:
-            search_locations = [Path(folder)]
-        else:
-            search_locations = [Path(loc) for loc in self.allowed_locations if Path(loc).exists()]
+        def is_within(path: Path, root: Path) -> bool:
+            try:
+                path.resolve().relative_to(root.resolve())
+                return True
+            except (ValueError, OSError):
+                return False
 
-        for search_folder in search_locations:
-            # Restrict to allowed locations
-            if str(search_folder) not in self.allowed_locations:
-                logger.warning(f"Search folder {search_folder} not in allowed locations")
+        allowed_roots = []
+        for location in self.allowed_locations:
+            try:
+                root = Path(os.path.expandvars(str(location))).expanduser()
+                if root.exists():
+                    allowed_roots.append(root.resolve())
+            except (OSError, RuntimeError):
                 continue
 
+        if folder:
+            requested = Path(os.path.expandvars(str(folder))).expanduser()
             try:
-                if not search_folder.exists():
-                    continue
+                requested = requested.resolve()
+            except (OSError, RuntimeError):
+                return []
+            if not any(is_within(requested, root) for root in allowed_roots):
+                logger.warning("Search folder %s is outside allowed locations", requested)
+                return []
+            search_roots = [requested]
+        else:
+            search_roots = allowed_roots
 
-                # If query looks like an extension (starts with .)
-                if query_lower.startswith('.'):
-                    ext = query_lower
-                    for file_path in search_folder.rglob('*'):
-                        if file_path.is_file() and file_path.suffix.lower() == ext:
+        # Dot-prefixed folder names are not file extensions. Extension matching
+        # is only enabled for conventional short suffixes such as .pdf or .txt.
+        extension_query = (
+            query_lower.startswith(".")
+            and len(query_lower) > 1
+            and len(query_lower) <= 12
+            and query_lower[1:].replace("_", "").replace("-", "").isalnum()
+        )
+
+        for root in search_roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            try:
+                for current, dirs, files in os.walk(root, onerror=lambda exc: logger.debug("Search access error: %s", exc)):
+                    # Avoid noisy/system trees while retaining hidden project folders.
+                    dirs[:] = [d for d in dirs if d.lower() not in {
+                        "node_modules", ".git", "__pycache__", "windows", "system volume information"
+                    }]
+                    current_path = Path(current)
+                    for dirname in dirs:
+                        if query_lower in dirname.casefold():
+                            p = current_path / dirname
                             results.append({
-                                "name": file_path.name,
-                                "path": str(file_path),
-                                "size": file_path.stat().st_size,
-                                "modified": file_path.stat().st_mtime,
+                                "name": dirname, "path": str(p), "type": "directory",
+                                "size": 0, "modified": p.stat().st_mtime
                             })
-                else:
-                    # Search by name pattern
-                    for file_path in search_folder.rglob('*'):
-                        if file_path.is_file() and query_lower in file_path.name.lower():
-                            results.append({
-                                "name": file_path.name,
-                                "path": str(file_path),
-                                "size": file_path.stat().st_size,
-                                "modified": file_path.stat().st_mtime,
-                            })
+                    for filename in files:
+                        p = current_path / filename
+                        try:
+                            matches = p.suffix.casefold() == query_lower if extension_query else query_lower in filename.casefold()
+                            if matches:
+                                results.append({
+                                    "name": filename, "path": str(p), "type": "file",
+                                    "size": p.stat().st_size, "modified": p.stat().st_mtime
+                                })
+                        except (OSError, PermissionError):
+                            continue
+                    if len(results) >= 500:
+                        break
+            except (OSError, PermissionError) as exc:
+                logger.debug("Search failed in %s: %s", root, exc)
+            if len(results) >= 500:
+                break
 
-            except Exception as e:
-                logger.error(f"Search error in {search_folder}: {e}")
-
-        # Sort by modification time, newest first, then by name for consistency
-        results.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
-
-        return results
+        results.sort(key=lambda item: (item.get("modified", 0), item["name"].casefold()), reverse=True)
+        return results[:500]
 
     def find_recent_files(self, folder: Optional[str] = None, days: int = 7) -> List[Dict[str, Any]]:
         """Find recently modified files."""
