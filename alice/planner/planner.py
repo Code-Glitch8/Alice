@@ -91,8 +91,8 @@ class TaskPlanner:
         elif intent_lower.startswith(("move ", "rename ")):
             steps = self._plan_move_file(user_intent)
         elif (
-            re.search(r"\\b(?:delete|remove)\\b.*\\b(?:file|folder|directory)\\b", intent_lower)
-            or re.search(r"\\b(?:delete|remove)\\s+(?:the\\s+)?[^ ]+\\.[a-z0-9]{1,8}\\s+from\\s+(?:downloads|desktop|documents)\\b", intent_lower)
+            re.search(r"\b(?:delete|remove)\b.*\b(?:file|folder|directory)\b", intent_lower)
+            or re.search(r"\b(?:delete|remove)\s+(?:the\s+)?[^ ]+\.[a-z0-9]{1,8}\s+from\s+(?:downloads|desktop|documents)\b", intent_lower)
         ):
             steps = self._plan_delete_file(user_intent)
         elif "download " in intent_lower:
@@ -418,7 +418,7 @@ class TaskPlanner:
         from alice.core.config import get_windows_known_folder
 
         value = value.strip().strip('"').strip("'")
-        match = re.match(r"^(desktop|documents|downloads)(?:[\\\\/](.*))?$", value, re.IGNORECASE)
+        match = re.match(r"^(desktop|documents|downloads)(?:[\\/](.*))?$", value, re.IGNORECASE)
         if match:
             root = get_windows_known_folder(match.group(1).title())
             if root:
@@ -428,7 +428,7 @@ class TaskPlanner:
     def _plan_move_file(self, intent: str) -> List[TaskStep]:
         """Plan a move/rename only when both source and destination are explicit."""
         import re
-        match = re.search(r"^\\s*(?:move|rename)\\s+(?:(?:the|a)\\s+)?(?:(?:file|folder|directory)\\s+)?(.+?)\\s+to\\s+(.+?)\\s*[.!?]*$", intent, re.IGNORECASE)
+        match = re.search(r"^\s*(?:move|rename)\s+(?:(?:the|a)\s+)?(?:(?:file|folder|directory)\s+)?(.+?)\s+to\s+(.+?)\s*[.!?]*$", intent, re.IGNORECASE)
         if not match:
             return self._plan_general_help(intent)
         source = self._resolve_known_location(match.group(1))
@@ -445,7 +445,7 @@ class TaskPlanner:
         from alice.core.config import get_windows_known_folder
 
         match = re.search(
-            r"^\\s*(?:delete|remove)\\s+(?:(?:the|a)\\s+)?(?:(file|folder|directory)\\s+)?(.+?)\\s+(?:from|in)\\s+(desktop|documents|downloads)\\s*[.!?]*$",
+            r"^\s*(?:delete|remove)\s+(?:(?:the|a)\s+)?(?:(file|folder|directory)\s+)?(.+?)\s+(?:from|in)\s+(desktop|documents|downloads)\s*[.!?]*$",
             intent, re.IGNORECASE
         )
         if match:
@@ -457,7 +457,7 @@ class TaskPlanner:
                 target = self._resolve_known_location(name)
         else:
             match = re.search(
-                r"^\\s*(?:delete|remove)\\s+(?:(?:the|a)\\s+)?(file|folder|directory)\\s+(?:named|called)?\\s*(.+?)\\s*[.!?]*$",
+                r"^\s*(?:delete|remove)\s+(?:(?:the|a)\s+)?(file|folder|directory)\s+(?:named|called)?\s*(.+?)\s*[.!?]*$",
                 intent, re.IGNORECASE
             )
             if not match:
