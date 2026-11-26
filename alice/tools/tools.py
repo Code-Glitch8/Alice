@@ -304,118 +304,95 @@ class SearchFilesTool(Tool):
 
 
 class BrowserOpenTool(Tool):
-    """Open browser with URL or search using Playwright."""
+    """Open a search or URL in the user's installed Google Chrome browser."""
 
     def __init__(self):
-        super().__init__("browser_open", "Open browser or perform search", required_permission="A")
+        super().__init__("browser_open", "Open Google Chrome or perform a web search", required_permission="A")
+
+    def _find_chrome_executable(self) -> Optional[str]:
+        """Find Chrome without launching a temporary Playwright profile."""
+        candidates = []
+        for root_var, suffix in (
+            ("PROGRAMFILES", r"Google\Chrome\Application\chrome.exe"),
+            ("PROGRAMFILES(X86)", r"Google\Chrome\Application\chrome.exe"),
+            ("LOCALAPPDATA", r"Google\Chrome\Application\chrome.exe"),
+        ):
+            root = os.environ.get(root_var)
+            if root:
+                candidates.append(Path(root) / suffix)
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        return shutil.which("chrome.exe") or shutil.which("chrome")
+
+    def _launch_chrome(self, url: Optional[str] = None, search: Optional[str] = None) -> dict:
+        """Ask installed Chrome to open a URL using its ordinary user profile."""
+        from urllib.parse import urlencode, urlparse
+
+        if search and not url:
+            query = str(search).strip()
+            if not query:
+                return {"status": "error", "action": "browser_open", "error": "Search query is empty."}
+            target_url = "https://www.google.com/search?" + urlencode({"q": query})
+        elif url:
+            target_url = str(url).strip()
+            parsed = urlparse(target_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                return {"status": "error", "action": "browser_open", "error": "URL must use http:// or https://."}
+        else:
+            return {"status": "error", "action": "browser_open", "error": "Provide a URL or search query."}
+
+        chrome_path = self._find_chrome_executable()
+        if not chrome_path:
+            return {
+                "status": "error", "action": "browser_open", "url": target_url,
+                "error": "Google Chrome was not found. Install Chrome or add chrome.exe to PATH."
+            }
+
+        try:
+            creation_flags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+            launch_kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "close_fds": True,
+            }
+            if creation_flags:
+                launch_kwargs["creationflags"] = creation_flags
+
+            # No --incognito or --user-data-dir flags: Chrome uses its normal
+            # installed profile. ALICE never terminates the user's browser.
+            process = subprocess.Popen([chrome_path, target_url], **launch_kwargs)
+            return {
+                "status": "success",
+                "action": "browser_open",
+                "browser": "Google Chrome",
+                "search": search,
+                "url": target_url,
+                "message": "Sent the URL to Google Chrome using its normal browsing profile. Chrome stays open for you to use.",
+                "verification": {
+                    "launch_requested": True,
+                    "incognito": False,
+                    "default_profile": True,
+                    "pid": getattr(process, "pid", None)
+                },
+                "error": None
+            }
+        except Exception as exc:
+            logger.exception("Could not launch Google Chrome")
+            return {"status": "error", "action": "browser_open", "url": target_url, "error": str(exc)}
 
     def execute(self, **kwargs) -> dict:
-        """Execute browser open/search.
+        """Launch Chrome visibly; browser lifetime is independent of this call."""
+        return self._launch_chrome(kwargs.get("url"), kwargs.get("search"))
 
-        If search is provided and no URL, performs a web search.
-        If URL is provided, navigates to it.
-        Returns status dict with execution result.
-        """
-        url = kwargs.get("url")
-        search = kwargs.get("search")
-        visible = kwargs.get("visible", False)  # New parameter for visible mode
-        try:
-            import asyncio
-
-            # Always use run_until_complete with a new loop for synchronous execution
-            # This ensures we wait for the browser to complete before returning
-            try:
-                loop = asyncio.get_running_loop()
-                # We're in an async context, need to create a task and wait for it
-                # Use asyncio.run() for clean async execution in async context
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, self._browser_open_async(url, search, visible))
-                    result = future.result(timeout=30)  # 30 second timeout for browser operations
-                return result
-            except RuntimeError:
-                # No running loop, use standard approach
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    result = loop.run_until_complete(self._browser_open_async(url, search, visible))
-                    return result
-                finally:
-                    loop.close()
-        except Exception as e:
-            logger.error(f"Browser open error: {e}")
-            return {"status": "error", "error": str(e)}
-
-    async def _browser_open_async(self, url: Optional[str] = None, search: Optional[str] = None, visible: bool = False) -> dict:
-        """Async browser open using Playwright.
-
-        Browser remains open for user interaction after initial load.
-        Uses persistent context (not incognito) for Chrome in normal mode.
-        """
-        try:
-            from playwright.async_api import async_playwright
-
-            async with async_playwright() as p:
-                # Launch browser in normal mode (not incognito/private)
-                # headless=False if visible=True, otherwise headless
-                browser = await p.chromium.launch(headless=not visible, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
-
-                # Use persistent context for normal browsing mode (not incognito)
-                # This makes Chrome open in normal user profile mode
-                context = await browser.new_context()
-                page = await context.new_page()
-
-                if search and not url:
-                    query = search if isinstance(search, str) else str(search)
-                    # Use browser_open with search parameter properly
-                    search_url = f"https://www.google.com/search?q={query}"
-                    await page.goto(search_url)
-                    await page.wait_for_load_state("networkidle")
-                    title = await page.title()
-                    current_url = page.url
-                    # Keep browser open for user interaction - do NOT close
-                    return {
-                        "status": "search_completed",
-                        "action": "browser_open",
-                        "search": query,
-                        "url": current_url,
-                        "title": title,
-                        "verification": {"page_loaded": True, "browser_open": True},
-                        "error": None,
-                        "browser_context": "persistent",
-                        "message": "Browser opened and search completed. Browser remains open for interaction."
-                    }
-                elif url:
-                    await page.goto(url)
-                    await page.wait_for_load_state("networkidle")
-                    title = await page.title()
-                    current_url = page.url
-                    # Keep browser open for user interaction - do NOT close
-                    return {
-                        "status": "navigated",
-                        "action": "browser_open",
-                        "url": url,
-                        "title": title,
-                        "url": current_url,
-                        "verification": {"page_loaded": True, "browser_open": True},
-                        "error": None,
-                        "browser_context": "persistent",
-                        "message": "Browser opened and page navigated. Browser remains open for interaction."
-                    }
-                else:
-                    # Keep browser open for user interaction
-                    return {
-                        "status": "idle",
-                        "action": "browser_open",
-                        "verification": {"browser_open": True},
-                        "error": "No URL or search provided",
-                        "message": "Browser is ready for interaction."
-                    }
-        except ImportError:
-            return {"status": "error", "error": "playwright not installed"}
-        except Exception as e:
-            logger.error(f"Browser async error: {e}")
-            return {"status": "error", "error": str(e)}
+    async def _browser_open_async(self, url: Optional[str] = None, search: Optional[str] = None, visible: bool = True) -> dict:
+        """Async-compatible wrapper retained for existing callers and tests."""
+        return await asyncio.to_thread(self._launch_chrome, url, search)
 
 
 class BrowserExtractTool(Tool):
@@ -1048,7 +1025,7 @@ class ToolDispatcher:
             return {"status": "error", "error": str(e)}
 
     async def execute_async(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a tool asynchronously."""
+        """Execute a tool asynchronously without blocking the chat event loop."""
         tool = self.tool_registry.get(tool_name)
         if not tool:
             return {"status": "error", "error": f"Tool '{tool_name}' not found"}
@@ -1058,16 +1035,16 @@ class ToolDispatcher:
             return {"status": "error", "error": f"Exceeded maximum tool calls ({self.max_tool_calls})"}
 
         try:
-            # Check if tool has async implementation
-            async_method = getattr(tool, '_execute_async', None)
-            if async_method:
+            async_method = getattr(tool, "_execute_async", None)
+            if callable(async_method):
                 result = await async_method(**arguments)
             else:
-                result = tool.execute(**arguments)
-            return result
-        except Exception as e:
-            logger.error(f"Async tool execution error for {tool_name}: {e}")
-            return {"status": "error", "error": str(e)}
+                result = await asyncio.to_thread(tool.execute, **arguments)
+            return result if isinstance(result, dict) else {"status": "success", "result": result}
+        except Exception as exc:
+            logger.exception("Async tool execution error for %s", tool_name)
+            return {"status": "error", "error": str(exc)}
+
 
 
 def create_default_tools() -> ToolRegistry:
