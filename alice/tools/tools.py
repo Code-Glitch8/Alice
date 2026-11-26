@@ -1075,7 +1075,7 @@ class TypeTextTool(Tool):
                 }
 
             time.sleep(max(0.3, delay))
-            result = set_text_to_clipboard(text, target_window=target_window)
+            result = set_text_to_clipboard(text, target_window=None if preserve_focus else target_window)
             if result.get("status") != "success":
                 return {
                     "status": "error",
