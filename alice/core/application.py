@@ -743,6 +743,14 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 continue
 
             arguments = self._normalize_tool_arguments(tool_name, arguments)
+            # Do not let a generic open_app call open the user's unrelated
+            # default Chrome session. All Chrome launches go through ALICE's
+            # separately managed, persistent profile.
+            if tool_name == "open_app":
+                requested_app = str(arguments.get("app_name") or arguments.get("app") or "").strip().lower()
+                if requested_app in {"chrome", "google chrome"}:
+                    tool_name = "browser_open"
+                    arguments = {"url": "https://www.google.com/"}
             tool = self.tool_registry.get(tool_name)
             if tool is None:
                 result = {"status": "error", "error": f"Tool '{tool_name}' not found"}
