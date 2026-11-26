@@ -44,7 +44,9 @@ class FileOperations:
                 return False
 
         allowed_roots = []
-        for location in list(self.allowed_locations) + [str(Path.cwd())]:
+        # Search the current project first so repository caches and project
+        # folders are found without scanning every user folder beforehand.
+        for location in [str(Path.cwd())] + list(self.allowed_locations):
             try:
                 root = Path(os.path.expandvars(str(location))).expanduser()
                 if root.exists():
