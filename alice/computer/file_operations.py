@@ -209,7 +209,7 @@ class FileOperations:
         except Exception as e:
             return False, str(e)
 
-    def read_file(self, path: str, max_bytes: int = 2 * 1024 * 1024) -> Tuple[bool, str, Dict[str, Any]]:
+    def read_file(self, path: str, max_bytes: int = 32 * 1024) -> Tuple[bool, str, Dict[str, Any]]:
         """Read a UTF-8 text file within the enabled access scope."""
         try:
             from alice.core.access_manager import ComputerAccessManager
