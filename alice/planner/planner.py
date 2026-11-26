@@ -68,37 +68,40 @@ class TaskPlanner:
 
     def plan(self, user_intent: str) -> List[TaskStep]:
         """Break down user intent into ordered, executable steps."""
-        intent_lower = user_intent.lower()
+        import re
+        intent_lower = user_intent.lower().strip()
 
-        # A search command that mentions Chrome is one browser operation:
-        # launching Chrome and passing it the requested search URL. Check this
-        # before the generic open-app branch so the query is not discarded.
-        if "search for " in intent_lower or "search the web for " in intent_lower or "search web for " in intent_lower:
-            steps = self._plan_browser_search(user_intent)
-        elif any(kw in intent_lower for kw in ["download "]):
-            steps = self._plan_browser_download(user_intent)
-        elif any(kw in intent_lower for kw in ["screenshot", "capture "]):
-            steps = self._plan_browser_screenshot(user_intent)
-        elif any(kw in intent_lower for kw in ["extract from ", "summarize ", "read page", "get content"]):
-            steps = self._plan_browser_extract(user_intent)
-        elif any(kw in intent_lower for kw in ["close ", "quit ", "exit "]):
-            steps = self._plan_close_app(user_intent)
-        elif any(kw in intent_lower for kw in ["open", "launch", "start"]) and "chrome" in intent_lower:
-            steps = [TaskStep(
-                1, "Open Google Chrome", "browser_open",
-                {"url": "https://www.google.com/", "visible": True}
-            )]
-        elif any(kw in intent_lower for kw in ["open", "launch", "start"]):
-            steps = self._plan_open_app(user_intent)
-        elif any(kw in intent_lower for kw in ["browser", "search chrome", "search web"]):
-            steps = self._plan_browser_search(user_intent)
-        elif any(kw in intent_lower for kw in ["find", "look for"]):
+        # Deterministic system inventory action must be recognized before generic
+        # open/search handling; otherwise small local models can loop on it.
+        if any(phrase in intent_lower for phrase in (
+            "list all the apps", "list all apps", "show installed apps",
+            "list installed applications", "what apps are installed",
+            "all installed programs", "applications on my pc", "apps on my pc",
+        )):
+            steps = [TaskStep(1, "List installed applications", "list_installed_apps", {})]
+        elif any(phrase in intent_lower for phrase in ("where is ", "locate ", "find ", "look for ", "search for ")):
             steps = self._plan_search_files(user_intent)
-        elif any(kw in intent_lower for kw in ["create", "make"]):
+        elif "search for " in intent_lower or "search the web for " in intent_lower or "search web for " in intent_lower:
+            steps = self._plan_browser_search(user_intent)
+        elif "download " in intent_lower:
+            steps = self._plan_browser_download(user_intent)
+        elif any(kw in intent_lower for kw in ("screenshot", "capture ")):
+            steps = self._plan_browser_screenshot(user_intent)
+        elif any(kw in intent_lower for kw in ("extract from ", "summarize ", "read page", "get content")):
+            steps = self._plan_browser_extract(user_intent)
+        elif any(kw in intent_lower for kw in ("close ", "quit ", "exit ")):
+            steps = self._plan_close_app(user_intent)
+        elif any(kw in intent_lower for kw in ("open", "launch", "start")) and "chrome" in intent_lower:
+            steps = [TaskStep(1, "Open Google Chrome", "browser_open", {"url": "https://www.google.com/", "visible": True})]
+        elif any(kw in intent_lower for kw in ("open", "launch", "start")):
+            steps = self._plan_open_app(user_intent)
+        elif any(kw in intent_lower for kw in ("browser", "search chrome", "search web")):
+            steps = self._plan_browser_search(user_intent)
+        elif any(kw in intent_lower for kw in ("create", "make")):
             steps = self._plan_create(user_intent)
-        elif any(kw in intent_lower for kw in ["extract", "unzip"]):
+        elif any(kw in intent_lower for kw in ("extract", "unzip")):
             steps = self._plan_extract_zip(user_intent)
-        elif any(kw in intent_lower for kw in ["help", "explain"]):
+        elif any(kw in intent_lower for kw in ("help", "explain")):
             steps = self._plan_general_help(user_intent)
         else:
             steps = [TaskStep(1, user_intent, "general", {"intent": user_intent}, requires_confirmation=True)]
@@ -227,13 +230,24 @@ class TaskPlanner:
         return steps
 
     def _plan_search_files(self, intent: str) -> List[TaskStep]:
-        """Plan searching for files."""
-        return [
-            TaskStep(
-                1, "Search files",
-                "search_files", {"query": intent}
-            )
-        ]
+        """Extract a filename/folder query and optional allowed-folder scope."""
+        import re
+        from alice.core.config import get_windows_known_folder
+
+        match = re.search(
+            r"(?:where is|locate|find|look for|search for)\\s+(?:the\\s+)?(.+?)(?:\\s+(?:folder|directory|file))?\\s*$",
+            intent, flags=re.IGNORECASE
+        )
+        query = match.group(1).strip().strip("\\\"'") if match else intent.strip()
+        folder = None
+        lowered = intent.lower()
+        for label in ("desktop", "documents", "downloads"):
+            if label in lowered:
+                known = get_windows_known_folder(label.title())
+                if known:
+                    folder = str(known)
+                break
+        return [TaskStep(1, f"Search for {query}", "search_files", {"query": query, "folder": folder})]
 
     def _plan_create(self, intent: str) -> List[TaskStep]:
         """Plan creating folders and files."""
