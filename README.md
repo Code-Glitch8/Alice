@@ -82,6 +82,14 @@ Example:
     "require_confirm_category_b": true,
     "restricted_category_c": true,
     "emergency_stop_enabled": true,
+    "search_all_drives": true,
+    "allow_read_files": true,
+    "allow_create_files_folders": true,
+    "allow_edit_files": true,
+    "allow_move_files": true,
+    "allow_app_control": true,
+    "allow_delete_files": true,
+    "require_confirmation_for_destructive": true,
     "allowed_locations": [
       "C:\\Users\\USERNAME\\Desktop",
       "C:\\Users\\USERNAME\\Documents",
@@ -90,6 +98,26 @@ Example:
   }
 }
 ```
+
+## Computer Access Manager
+
+Open the ALICE dashboard Settings tab to configure computer access. The requested defaults enable all of these permissions:
+
+- Search all mounted drives (Windows drive letters discovered at runtime).
+- Read accessible UTF-8 text files (2 MiB per-file limit).
+- Create files and folders.
+- Edit existing files.
+- Move and organize files and folders.
+- Control installed applications and windows.
+- Delete files and folders.
+
+The settings are saved in the local ALICE config file under the `automation` section. Existing config files inherit the new defaults when loaded.
+
+**Mandatory safety enforcement:** ALICE always asks for explicit approval before overwriting an existing file, moving a file/folder, or deleting a file/folder. The prompt includes the exact target; folder deletion also reports the number of contained items. The model cannot approve its own action by passing a tool argument. Drive roots and critical Windows installation folders are protected from destructive operations. These confirmation rules cannot be disabled in the dashboard.
+
+ALICE does not request Administrator elevation or bypass Windows permissions. It can access only locations the signed-in Windows account can access. Drive search skips operating-system and application-installation trees to avoid spending time crawling Windows and Program Files; inaccessible folders are skipped. If **Search all mounted drives** is turned off, search is limited to configured allowed locations and the ALICE working directory.
+
+New file tools: `read_file(path)` and `move_file(src, dst)`. File reads are text-only and bounded; binary files are not loaded into the model context.
 
 ## Available Tools
 
@@ -101,7 +129,9 @@ Example:
 
 **File Operations (Category A):**
 - `create_folder` - Create directories
-- `search_files` - Search for files by name/extension
+- `search_files` - Search for files by name/extension across enabled drives
+- `read_file` - Read a UTF-8 text file (2 MiB limit)
+- `move_file` - Move or organize files/folders (explicit approval required)
 
 **Browser Automation (Category A/B):**
 - `browser_open` - Open browser or search web
@@ -183,7 +213,7 @@ The LM Studio adapter tests use a local fake HTTP server. They verify API reques
 - The default endpoint is loopback-only (`127.0.0.1`).
 - Do not enable LAN serving unless you have a specific reason and understand the access implications.
 - Never execute arbitrary model-generated shell commands. All tool calls are validated against ALICE's registered tools and permission rules.
-- Category B actions require confirmation (configurable).
+- Destructive file actions (overwrite, move, delete) always require explicit confirmation, independent of the general Category B setting.
 - Category C actions are restricted by default.
 - Emergency stop: move mouse to top-left corner (0,0) to trigger pyautogui failsafe.
 - All automation stays local - no cloud dependencies.
