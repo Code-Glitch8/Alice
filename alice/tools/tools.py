@@ -949,6 +949,30 @@ class CloseAllAppsTool(Tool):
             return {"status": "error", "error": str(e)}
 
 
+class ListInstalledAppsTool(Tool):
+    """List applications discovered on this Windows installation."""
+
+    def __init__(self):
+        super().__init__("list_installed_apps", "List installed applications on this PC", required_permission="A")
+
+    def execute(self, **kwargs) -> dict:
+        try:
+            from alice.computer.engine import ComputerEngine
+            apps = ComputerEngine().list_installed_apps()
+            apps = sorted(apps, key=lambda app: str(app.get("name", "")).casefold())
+            return {
+                "status": "success",
+                "action": "list_installed_apps",
+                "message": f"Found {len(apps)} application entries.",
+                "result": {"apps": apps[:500]},
+                "verification": {"apps_count": len(apps)},
+                "error": None,
+            }
+        except Exception as exc:
+            logger.exception("ListInstalledAppsTool failed")
+            return {"status": "error", "action": "list_installed_apps", "message": str(exc), "error": str(exc)}
+
+ 
 class GetOpenAppsTool(Tool):
     """Get list of applications opened by ALICE."""
 
@@ -1685,6 +1709,7 @@ def create_default_tools() -> ToolRegistry:
     registry.register(OpenAppTool())
     registry.register(CloseAppTool())
     registry.register(FocusAppTool())
+    registry.register(ListInstalledAppsTool())
 
     # File and folder tools
     registry.register(CreateFolderTool())
