@@ -163,7 +163,7 @@ class TaskPlanner:
                 steps.append(TaskStep(3, "Open a new blank Notepad document", "keyboard_shortcut", {"keys": "ctrl+n"}))
             steps.append(TaskStep(
                 len(steps) + 1, f"Write a short note about {topic}", "type_text",
-                {"generate_topic": topic, "target_window": app_name}
+                {"generate_topic": topic, "target_window": app_name, "preserve_focus": True}
             ))
             text = None
         elif write_match:
@@ -180,7 +180,7 @@ class TaskPlanner:
                     steps.append(TaskStep(3, "Open a new blank Notepad document", "keyboard_shortcut", {"keys": "ctrl+n"}))
                 steps.append(TaskStep(
                     len(steps) + 1, f"Write supplied text in {app_name}", "type_text",
-                    {"text": text, "target_window": app_name}
+                    {"text": text, "target_window": app_name, "preserve_focus": True}
                 ))
 
         save_match = re.search(r"\bsave\s+as\s+([^\s,]+)", intent, flags=re.IGNORECASE)
