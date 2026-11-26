@@ -231,6 +231,46 @@ def test_planner_maps_explicit_close_chrome_to_owned_close_tool():
 
 
 
+
+def test_plain_chrome_open_uses_the_managed_browser_tool():
+    steps = TaskPlanner(None).plan("open Chrome")
+    assert len(steps) == 1
+    assert steps[0].tool_name == "browser_open"
+    assert steps[0].parameters["url"] == "https://www.google.com/"
+
+
+def test_model_open_app_chrome_call_is_redirected_to_managed_profile():
+    app = make_app()
+    app.tool_dispatcher.execute_async = AsyncMock(
+        return_value={"status": "success", "message": "Opened managed Chrome"}
+    )
+    calls = [{
+        "id": "chrome_open",
+        "type": "function",
+        "function": {"name": "open_app", "arguments": '{"app_name":"chrome"}'},
+    }]
+
+    results = asyncio.run(app._execute_tool_calls(calls, [], ""))
+
+    app.tool_dispatcher.execute_async.assert_awaited_once_with(
+        "browser_open", {"url": "https://www.google.com/"}
+    )
+    assert results[0]["tool_call_id"] == "chrome_open"
+
+
+def test_close_chrome_with_no_alice_profile_does_not_touch_default_chrome(monkeypatch):
+    import psutil
+    from alice.tools.tools import CloseAppTool
+
+    monkeypatch.setattr(BrowserOpenTool, "_managed_profile_dir", None)
+    with patch("psutil.process_iter", return_value=[]):
+        result = CloseAppTool().execute(app_name="chrome")
+
+    assert result["status"] == "success"
+    assert "other Chrome windows were left untouched" in result["message"]
+
+
+
 def test_chrome_launcher_does_not_claim_success_when_not_installed():
     tool = BrowserOpenTool()
     tool._find_chrome_executable = lambda: None
