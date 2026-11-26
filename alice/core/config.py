@@ -188,10 +188,20 @@ def resolve_allowed_locations() -> list:
 @dataclass
 class AutomationConfig:
     auto_confirm_category_a: bool = True
-    require_confirm_category_b: bool = False  # Set to False to auto-confirm Category B actions
+    require_confirm_category_b: bool = False  # Non-destructive Category B actions retain the existing policy.
     restricted_category_c: bool = True
     emergency_stop_enabled: bool = True
     allowed_locations: list = field(default_factory=resolve_allowed_locations)
+    # Computer Access Manager defaults requested by the user. Windows still
+    # enforces the current account's filesystem permissions; ALICE never elevates.
+    search_all_drives: bool = True
+    allow_read_files: bool = True
+    allow_create_files_folders: bool = True
+    allow_edit_files: bool = True
+    allow_move_files: bool = True
+    allow_app_control: bool = True
+    allow_delete_files: bool = True
+    require_confirmation_for_destructive: bool = True
 
 
 @dataclass
