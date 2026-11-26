@@ -149,11 +149,11 @@ class TaskPlanner:
         # Distinguish literal text supplied by the user from a request to
         # compose content. Never paste the instruction itself as the document.
         note_match = re.search(
-            r"\\b(?:write|create|make)\\s+(?:a\\s+)?short\\s+(?:note|paragraph)\\s+(?:on|about)\\s+(.+?)(?:[.!?]?$)",
+            r'\\b(?:write|create|make)\\s+(?:a\\s+)?short\\s+(?:note|paragraph)\\s+(?:on|about)\\s+(.+?)(?:[.!?]?$)',
             intent, flags=re.IGNORECASE
         )
         write_match = re.search(
-            r"\\b(?:type|write|enter)\\s+(?:exactly\\s+)?(?:\\"([^\\"]+)\\"|'([^']+)'|(.+?))(?=\\s*(?:,?\\s*(?:and\\s+)?save\\s+as\\b|$))",
+            r'\\b(?:type|write|enter)\\s+(.+?)(?=\\s*(?:,?\\s*(?:and\\s+)?save\\s+as\\b|$))',
             intent, flags=re.IGNORECASE | re.DOTALL
         )
         if note_match:
@@ -167,14 +167,11 @@ class TaskPlanner:
             ))
             text = None
         elif write_match:
-            quoted = write_match.group(1) or write_match.group(2)
-            unquoted = write_match.group(3)
-            # Unquoted prose is an instruction to compose, not necessarily
-            # literal text. Only paste unquoted content when user says "type exactly".
-            if quoted is not None:
-                text = quoted.strip()
-            elif unquoted and re.match(r"\\s*exactly\\s+", unquoted, re.IGNORECASE):
-                text = re.sub(r"^\\s*exactly\\s+", "", unquoted, flags=re.IGNORECASE).strip()
+            supplied = write_match.group(1).strip()
+            if (len(supplied) >= 2 and supplied[0] == supplied[-1] and supplied[0] in "\\\"'"):
+                text = supplied[1:-1]
+            elif supplied.lower().startswith("exactly "):
+                text = supplied[8:].strip()
             else:
                 text = None
             if text:
