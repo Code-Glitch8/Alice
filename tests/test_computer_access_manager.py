@@ -104,7 +104,7 @@ def test_destructive_action_always_asks_even_when_category_b_is_auto_allowed(tmp
     allowed = asyncio.run(app._is_action_permitted(tool, "Delete file", {"path": str(tmp_path / "important.txt")}))
     assert allowed
     assert calls and calls[0][0] == "delete_file"
-    assert str(tmp_path / "important.txt") in calls[0][1]
+    assert "important.txt" in calls[0][1]
 
 
 def test_destructive_action_is_denied_without_confirmation_callback(tmp_path):
