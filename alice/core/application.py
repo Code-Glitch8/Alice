@@ -14,6 +14,7 @@ from alice.ai.lmstudio_adapter import LMStudioAdapter, LMStudioError
 from alice.ai.runtime_manager import RuntimeManager
 from alice.tools.tools import create_default_tools, ToolDispatcher, Tool
 from alice.planner.planner import TaskPlanner, TaskStep
+from alice.core.access_manager import ComputerAccessManager
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,9 @@ Available tools:
 - close_app(app_name: string): Close an application
 - focus_app(app_name: string): Focus an application window
 - create_folder(path: string): Create a folder
-- search_files(query: string, folder?: string): Search for files by name or content
+- search_files(query: string, folder?: string): Search files across enabled drives
+- read_file(path: string): Read a UTF-8 text file within the enabled access scope
+- move_file(src: string, dst: string): Move or organize a file/folder (requires approval)
 - browser_open(url?: string, search?: string): Open browser or search the web
 - browser_extract(url: string, selector?: string): Extract text content from a web page
 - browser_download(url: string, destination?: string): Download a file from the web
@@ -71,8 +74,14 @@ Available tools:
 - get_open_apps(): List applications opened by ALICE
 - get_app_status(app_name: string): Get status of a specific application
 - write_file(path: string, content?: string, encoding?: string): Write content to a file
-- delete_file(path: string, confirm?: boolean): Delete a file
-- delete_folder(path: string, recursive?: boolean): Delete a folder and its contents
+- delete_file(path: string): Delete a file (always requires explicit approval)
+- delete_folder(path: string, recursive?: boolean): Delete a folder (always requires explicit approval)
+
+Computer access policy:
+- Respect the Computer Access Manager permissions and the current Windows account's access.
+- Never request Administrator elevation or bypass Windows permissions.
+- Before overwriting, moving, or deleting files/folders, describe the exact target and ask the user for approval.
+- Never treat a model-generated confirmation argument as user approval.
 
 Only call tools when the user explicitly requests a computer action. For normal conversation, respond normally without tool calls."""
 
@@ -286,7 +295,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 })
                 break
 
-            if not await self._is_action_permitted(tool, step.description):
+            if not await self._is_action_permitted(tool, step.description, step.parameters):
                 step.requires_confirmation = True
                 results.append({
                     "step": step.description, "tool": step.tool_name,
@@ -697,6 +706,17 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 tool_def["function"]["parameters"]["properties"] = {}
             elif tool.name == "emergency_stop":
                 tool_def["function"]["parameters"]["properties"] = {}
+            elif tool.name == "read_file":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "path": {"type": "string", "description": "Absolute path to a UTF-8 text file"}
+                }
+                tool_def["function"]["parameters"]["required"] = ["path"]
+            elif tool.name == "move_file":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "src": {"type": "string", "description": "Existing source file or folder"},
+                    "dst": {"type": "string", "description": "New destination path"}
+                }
+                tool_def["function"]["parameters"]["required"] = ["src", "dst"]
             elif tool.name == "write_file":
                 tool_def["function"]["parameters"]["properties"] = {
                     "path": {"type": "string", "description": "Full path to the file to write"},
@@ -750,6 +770,8 @@ Only call tools when the user explicitly requests a computer action. For normal 
             "set_clipboard": {"content": "content"},
             "select_text": {"method": "method"},
             "write_file": {"path": "path", "content": "content", "encoding": "encoding"},
+            "read_file": {"path": "path"},
+            "move_file": {"src": "src", "source": "src", "dst": "dst", "destination": "dst"},
             "delete_file": {"path": "path", "confirm": "confirm"},
             "delete_folder": {"path": "path", "recursive": "recursive"},
         }
@@ -818,7 +840,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
             tool = self.tool_registry.get(tool_name)
             if tool is None:
                 result = {"status": "error", "error": f"Tool '{tool_name}' not found"}
-            elif not await self._is_action_permitted(tool, f"Call {tool_name}"):
+            elif not await self._is_action_permitted(tool, f"Call {tool_name}", arguments):
                 result = {
                     "status": "blocked",
                     "error": f"Permission denied for tool {tool_name} (category {tool.required_permission})."
@@ -834,23 +856,61 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         return tool_results
 
-    async def _is_action_permitted(self, tool, description: str = "") -> bool:
-        """Check policy and, for Category B only, request explicit user approval.
+    async def _is_action_permitted(self, tool, description: str = "", arguments: Optional[Dict[str, Any]] = None) -> bool:
+        """Enforce feature toggles and require fresh approval for destructive file actions."""
+        arguments = arguments or {}
+        access = ComputerAccessManager(self.config)
+        if not access.permission_enabled(tool.name):
+            return False
 
-        Category A follows its configured auto-confirm policy. Category C stays
-        blocked whenever restricted. A frontend must provide a confirmation
-        callback to approve Category B; a missing callback never grants access.
-        """
+        destructive = tool.name in {"move_file", "delete_file", "delete_folder"}
+        target = arguments.get("path") or arguments.get("src") or arguments.get("source")
+        if tool.name == "write_file" and target:
+            try:
+                from pathlib import Path
+                target_path = Path(os.path.expandvars(os.path.expanduser(str(target)))).resolve(strict=False)
+                if target_path.exists():
+                    if not bool(getattr(self.automation_config, "allow_edit_files", True)):
+                        return False
+                    destructive = True
+            except (OSError, RuntimeError):
+                return False
+
+        if destructive:
+            if not bool(getattr(self.automation_config, "require_confirmation_for_destructive", True)):
+                # This setting may disable ALICE's extra confirmation, but the
+                # destructive operation still remains Category B policy gated.
+                pass
+            callback = self.permission_confirmation_callback
+            if not callable(callback):
+                return False
+            details = dict(arguments)
+            if tool.name == "delete_folder" and target:
+                try:
+                    from pathlib import Path
+                    folder = Path(target)
+                    if folder.is_dir():
+                        details["items_inside"] = sum(1 for _ in folder.rglob("*"))
+                except OSError:
+                    details["items_inside"] = "could not count"
+            summary = f"{description or tool.name}: {json.dumps(details, ensure_ascii=False, default=str)}"
+            try:
+                result = callback(tool.name, summary)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result is True
+            except Exception:
+                logger.exception("Destructive-action confirmation failed for %s", tool.name)
+                return False
+
         if self._check_permission(tool):
             return True
-
         if tool.required_permission != "B":
             return False
 
         callback = self.permission_confirmation_callback
         if not callable(callback):
             return False
-
         try:
             result = callback(tool.name, description or tool.name)
             if inspect.isawaitable(result):
@@ -936,6 +996,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
             "running": self.running,
             "ai": self.runtime.get_status(),
             "tools": [t.name for t in self.tool_registry.list_tools()],
+            "computer_access": ComputerAccessManager(self.config).status(),
         }
 
     def run(self) -> None:
