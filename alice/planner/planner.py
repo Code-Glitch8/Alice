@@ -149,11 +149,11 @@ class TaskPlanner:
         # Distinguish literal text supplied by the user from a request to
         # compose content. Never paste the instruction itself as the document.
         note_match = re.search(
-            r'\\b(?:write|create|make)\\s+(?:a\\s+)?short\\s+(?:note|paragraph)\\s+(?:on|about)\\s+(.+?)(?:[.!?]?$)',
+            r'\b(?:write|create|make)\s+(?:a\s+)?short\s+(?:note|paragraph)\s+(?:on|about)\s+(.+?)(?:[.!?]?$)',
             intent, flags=re.IGNORECASE
         )
         write_match = re.search(
-            r'\\b(?:type|write|enter)\\s+(.+?)(?=\\s*(?:,?\\s*(?:and\\s+)?save\\s+as\\b|$))',
+            r'\b(?:type|write|enter)\s+(.+?)(?=\s*(?:,?\s*(?:and\s+)?save\s+as\b|$))',
             intent, flags=re.IGNORECASE | re.DOTALL
         )
         if note_match:
@@ -168,7 +168,7 @@ class TaskPlanner:
             text = None
         elif write_match:
             supplied = write_match.group(1).strip()
-            if (len(supplied) >= 2 and supplied[0] == supplied[-1] and supplied[0] in "\\\"'"):
+            if len(supplied) >= 2 and supplied[0] == supplied[-1] and supplied[0] in ('"', "'"):
                 text = supplied[1:-1]
             elif supplied.lower().startswith("exactly "):
                 text = supplied[8:].strip()
@@ -257,12 +257,12 @@ class TaskPlanner:
         from alice.core.config import get_windows_known_folder
 
         match = re.search(
-            r"(?:where is|locate|find|look for|search for)\\s+(?:the\\s+)?(.+?)\\s*$",
+            r"(?:where is|locate|find|look for|search for)\s+(?:the\s+)?(.+?)\s*$",
             intent, flags=re.IGNORECASE
         )
         query = match.group(1).strip() if match else intent.strip()
-        query = re.sub(r"\\s+(?:folder|directory|file)$", "", query, flags=re.IGNORECASE).strip()
-        query = query.strip("\\\"'").strip()
+        query = re.sub(r"\s+(?:folder|directory|file)$", "", query, flags=re.IGNORECASE).strip()
+        query = query.strip("\"'").strip()
         folder = None
         lowered = intent.lower()
         for label in ("desktop", "documents", "downloads"):
