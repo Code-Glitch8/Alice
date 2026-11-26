@@ -884,6 +884,8 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 if target_path.exists():
                     if not bool(getattr(self.automation_config, "allow_edit_files", True)):
                         return False
+                    if access.protected_destructive_path(target_path):
+                        return False
                     destructive = True
             except (OSError, RuntimeError):
                 return False
@@ -904,6 +906,8 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     source = Path(str(arguments.get("src") or arguments.get("source"))).expanduser()
                     if destination.is_dir():
                         details["resolved_destination"] = str(destination / source.name)
+                    if source.is_dir():
+                        details["items_inside"] = sum(1 for _ in source.rglob("*"))
                 except (OSError, TypeError, ValueError):
                     pass
             if tool.name == "delete_folder" and target:
