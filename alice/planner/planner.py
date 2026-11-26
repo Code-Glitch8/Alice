@@ -88,6 +88,13 @@ class TaskPlanner:
             steps = self._plan_search_files(user_intent)
         elif "search for " in intent_lower:
             steps = self._plan_browser_search(user_intent)
+        elif intent_lower.startswith(("move ", "rename ")):
+            steps = self._plan_move_file(user_intent)
+        elif (
+            re.search(r"\\b(?:delete|remove)\\b.*\\b(?:file|folder|directory)\\b", intent_lower)
+            or re.search(r"\\b(?:delete|remove)\\s+(?:the\\s+)?[^ ]+\\.[a-z0-9]{1,8}\\s+from\\s+(?:downloads|desktop|documents)\\b", intent_lower)
+        ):
+            steps = self._plan_delete_file(user_intent)
         elif "download " in intent_lower:
             steps = self._plan_browser_download(user_intent)
         elif any(kw in intent_lower for kw in ("screenshot", "capture ")):
@@ -403,6 +410,65 @@ class TaskPlanner:
                     "create_folder", {"path": str(full_path)}
                 )
             ]
+
+    def _resolve_known_location(self, value: str) -> str:
+        """Resolve explicit Desktop/Documents/Downloads prefixes without guessing."""
+        import re
+        from pathlib import Path
+        from alice.core.config import get_windows_known_folder
+
+        value = value.strip().strip('"').strip("'")
+        match = re.match(r"^(desktop|documents|downloads)(?:[\\\\/](.*))?$", value, re.IGNORECASE)
+        if match:
+            root = get_windows_known_folder(match.group(1).title())
+            if root:
+                return str(root / match.group(2)) if match.group(2) else str(root)
+        return str(Path(value).expanduser())
+
+    def _plan_move_file(self, intent: str) -> List[TaskStep]:
+        """Plan a move/rename only when both source and destination are explicit."""
+        import re
+        match = re.search(r"^\\s*(?:move|rename)\\s+(?:(?:the|a)\\s+)?(?:(?:file|folder|directory)\\s+)?(.+?)\\s+to\\s+(.+?)\\s*[.!?]*$", intent, re.IGNORECASE)
+        if not match:
+            return self._plan_general_help(intent)
+        source = self._resolve_known_location(match.group(1))
+        destination = self._resolve_known_location(match.group(2))
+        return [TaskStep(
+            1, f"Move {source} to {destination}", "move_file",
+            {"src": source, "dst": destination}, requires_confirmation=True
+        )]
+
+    def _plan_delete_file(self, intent: str) -> List[TaskStep]:
+        """Plan deletion of an explicitly named file or folder."""
+        import re
+        from pathlib import Path
+        from alice.core.config import get_windows_known_folder
+
+        match = re.search(
+            r"^\\s*(?:delete|remove)\\s+(?:(?:the|a)\\s+)?(?:(file|folder|directory)\\s+)?(.+?)\\s+(?:from|in)\\s+(desktop|documents|downloads)\\s*[.!?]*$",
+            intent, re.IGNORECASE
+        )
+        if match:
+            kind, name, location = match.groups()
+            root = get_windows_known_folder(location.title())
+            if root:
+                target = str(root / Path(name.strip().strip('"').strip("'")).name)
+            else:
+                target = self._resolve_known_location(name)
+        else:
+            match = re.search(
+                r"^\\s*(?:delete|remove)\\s+(?:(?:the|a)\\s+)?(file|folder|directory)\\s+(?:named|called)?\\s*(.+?)\\s*[.!?]*$",
+                intent, re.IGNORECASE
+            )
+            if not match:
+                return self._plan_general_help(intent)
+            kind, name = match.groups()
+            target = self._resolve_known_location(name)
+        tool_name = "delete_folder" if kind and kind.lower() in {"folder", "directory"} else "delete_file"
+        return [TaskStep(
+            1, f"Delete {target}", tool_name, {"path": target},
+            requires_confirmation=True
+        )]
 
     def _plan_extract_zip(self, intent: str) -> List[TaskStep]:
         """Plan ZIP extraction."""
