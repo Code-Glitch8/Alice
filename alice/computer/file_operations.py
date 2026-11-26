@@ -13,6 +13,8 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
+from alice.core.access_manager import ComputerAccessManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,18 +45,10 @@ class FileOperations:
             except (ValueError, OSError):
                 return False
 
-        allowed_roots = []
-        # Search the current project first so repository caches and project
-        # folders are found without scanning every user folder beforehand.
-        for location in [str(Path.cwd())] + list(self.allowed_locations):
-            try:
-                root = Path(os.path.expandvars(str(location))).expanduser()
-                if root.exists():
-                    resolved_root = root.resolve()
-                    if resolved_root not in allowed_roots:
-                        allowed_roots.append(resolved_root)
-            except (OSError, RuntimeError):
-                continue
+        # Roots are discovered from the current configuration. With
+        # search_all_drives enabled this includes every mounted drive that the
+        # current Windows account can access, plus the current project folder.
+        allowed_roots = ComputerAccessManager(self.config).roots()
 
         if folder:
             requested = Path(os.path.expandvars(str(folder))).expanduser()
@@ -84,8 +78,11 @@ class FileOperations:
             try:
                 for current, dirs, files in os.walk(root, onerror=lambda exc: logger.debug("Search access error: %s", exc)):
                     # Avoid noisy/system trees while retaining hidden project folders.
-                    dirs[:] = [d for d in dirs if d.lower() not in {
-                        "node_modules", ".git", "__pycache__", "windows", "system volume information"
+                    dirs[:] = [d for d in dirs if d.casefold() not in {
+                        "node_modules", ".git", "__pycache__", "windows",
+                        "system volume information", "$recycle.bin", "recovery",
+                        "program files", "program files (x86)", "programdata",
+                        "perfLogs".casefold()
                     }]
                     current_path = Path(current)
                     for dirname in dirs:
@@ -211,6 +208,48 @@ class FileOperations:
             return True, f"Moved {src} to {dst}"
         except Exception as e:
             return False, str(e)
+
+    def read_file(self, path: str, max_bytes: int = 2 * 1024 * 1024) -> Tuple[bool, str, Dict[str, Any]]:
+        """Read a UTF-8 text file within the enabled access scope."""
+        try:
+            from alice.core.access_manager import ComputerAccessManager
+            manager = ComputerAccessManager(self.config)
+            allowed, reason = manager.validate_path(path)
+            if not allowed:
+                return False, reason, {"path": str(path)}
+            file_path = Path(path).expanduser().resolve()
+            if not file_path.exists() or not file_path.is_file():
+                return False, f"File not found: {file_path}", {"path": str(file_path)}
+            size = file_path.stat().st_size
+            if size > max_bytes:
+                return False, f"File is {size} bytes; the read limit is {max_bytes} bytes.", {"path": str(file_path), "size": size}
+            content = file_path.read_text(encoding="utf-8")
+            return True, content, {"path": str(file_path), "size": size}
+        except (UnicodeDecodeError, OSError, PermissionError) as exc:
+            return False, str(exc), {"path": str(path)}
+
+    def move_file(self, src: str, dst: str) -> Tuple[bool, str, Dict[str, Any]]:
+        """Move a file or folder without overwriting an existing destination."""
+        try:
+            from alice.core.access_manager import ComputerAccessManager
+            manager = ComputerAccessManager(self.config)
+            for candidate in (src, dst):
+                allowed, reason = manager.validate_path(candidate)
+                if not allowed:
+                    return False, reason, {"source": str(src), "destination": str(dst)}
+            source = Path(src).expanduser().resolve()
+            destination = Path(dst).expanduser().resolve()
+            if not source.exists():
+                return False, f"Source not found: {source}", {"source": str(source)}
+            if manager.protected_destructive_path(source):
+                return False, f"Refusing to move a protected system location: {source}", {"source": str(source)}
+            if destination.exists():
+                return False, f"Destination already exists; refusing to overwrite: {destination}", {"destination": str(destination)}
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            return True, f"Moved {source} to {destination}", {"source": str(source), "destination": str(destination)}
+        except (OSError, PermissionError, shutil.Error) as exc:
+            return False, str(exc), {"source": str(src), "destination": str(dst)}
 
     # ZIP operations
     def extract_zip(self, archive_path: str, destination: Optional[str] = None) -> Tuple[bool, str, List[Dict[str, Any]]]:
