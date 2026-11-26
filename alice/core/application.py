@@ -108,6 +108,20 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         messages = [{"role": "system", "content": self.system_prompt}] + [dict(item) for item in history if item.get("role") != "system"]
         tool_definitions = tools if tools is not None else self.get_tools_for_api()
+
+        # These requests have deterministic local handlers. Running them before
+        # model tool-calling avoids repeated malformed calls from small local models.
+        original_request = self._get_user_message(history) or ""
+        request_lower = original_request.casefold()
+        if any(phrase in request_lower for phrase in (
+            "list all the apps", "list all apps", "show installed apps",
+            "list installed applications", "what apps are installed",
+            "all installed programs", "applications on my pc", "apps on my pc",
+        )) or (
+            any(phrase in request_lower for phrase in ("where is ", "locate ", "find ", "look for "))
+            and any(token in request_lower for token in (".pytest_cache", "folder", "directory", "file"))
+        ):
+            return await self._execute_planned_tasks(history, original_request, [])
         max_rounds = max(1, int(getattr(self.automation_config, "max_tool_calls", 5) or 5))
         self.current_tool_call_count = 0
         self.tool_dispatcher.call_count = 0
@@ -286,6 +300,25 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     )
                 })
                 break
+
+            if step.tool_name == "type_text" and step.parameters.get("generate_topic"):
+                topic = str(step.parameters.pop("generate_topic")).strip()
+                try:
+                    generated = await self.runtime.chat([
+                        {"role": "system", "content": "You write clear, age-appropriate educational notes. Return only the note text, with no preamble."},
+                        {"role": "user", "content": f"Write a short 4-5 sentence school-level note about {topic}."},
+                    ], tools=None)
+                    if isinstance(generated, dict):
+                        generated = generated.get("content") or generated.get("text") or ""
+                    if not isinstance(generated, str) or not generated.strip():
+                        raise RuntimeError("The local model returned no note text.")
+                    step.parameters["text"] = generated.strip()
+                except Exception as exc:
+                    results.append({
+                        "step": step.description, "tool": step.tool_name,
+                        "status": "error", "message": f"Could not generate note content: {exc}"
+                    })
+                    break
 
             try:
                 result = await self.tool_dispatcher.execute_async(step.tool_name, step.parameters)
