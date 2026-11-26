@@ -866,6 +866,17 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         destructive = tool.name in {"move_file", "delete_file", "delete_folder"}
         target = arguments.get("path") or arguments.get("src") or arguments.get("source")
+        # Reject out-of-scope or protected targets before asking the user to approve.
+        if tool.name in {"write_file", "move_file", "delete_file", "delete_folder"}:
+            candidates = [target] if target else []
+            if tool.name == "move_file":
+                candidates.append(arguments.get("dst") or arguments.get("destination"))
+            for candidate in candidates:
+                if not candidate or not access.path_allowed(candidate):
+                    return False
+            if tool.name in {"move_file", "delete_file", "delete_folder"}:
+                if any(access.protected_destructive_path(candidate) for candidate in candidates):
+                    return False
         if tool.name == "write_file" and target:
             try:
                 from pathlib import Path
