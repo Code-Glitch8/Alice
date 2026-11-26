@@ -9,7 +9,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from alice.ai.lmstudio_adapter import LMStudioAdapter
+from alice.ai.lmstudio_adapter import LMStudioAdapter, LMStudioError
 from alice.ai.runtime_manager import RuntimeManager
 from alice.tools.tools import create_default_tools, ToolDispatcher, Tool
 from alice.planner.planner import TaskPlanner, TaskStep
@@ -91,106 +91,104 @@ Only call tools when the user explicitly requests a computer action. For normal 
         ])
 
     async def chat_with_tools(self, history: List[Dict[str, str]], tools: Optional[List[Dict]] = None) -> str:
-        """Chat with tool calling support.
+        """Chat with the model and execute tool calls until a final answer is produced.
 
-        Uses native tool calling when tools are provided to LM Studio.
-        Falls back to parsing AI response if tool calls are returned as text/JSON.
-        Integrates the task planner for compound commands.
-        Implements an iterative tool execution loop that continues until the model
-        produces a final response (not just tool calls).
+        Tool results are fed back through this single bounded loop. If Qwen emits
+        reasoning without a user-facing answer, ALICE attempts a deterministic
+        plan from the user's actual request rather than claiming the action ran.
         """
         if not self.initialized and not await self.initialize():
             raise RuntimeError(self.ai_adapter.last_error or "LM Studio is unavailable")
 
-        # Prepare messages with system prompt
-        messages = [{"role": "system", "content": self.system_prompt}] + history
+        messages = [{"role": "system", "content": self.system_prompt}] + [dict(item) for item in history if item.get("role") != "system"]
+        tool_definitions = tools if tools is not None else self.get_tools_for_api()
+        max_rounds = max(1, int(getattr(self.automation_config, "max_tool_calls", 5) or 5))
+        self.current_tool_call_count = 0
+        self.tool_dispatcher.call_count = 0
 
-        # Get tools for API if not provided
-        if tools is None:
-            tools = self.get_tools_for_api()
+        for round_count in range(1, max_rounds + 1):
+            try:
+                response = await self.runtime.chat(messages, tools=tool_definitions)
+            except LMStudioError as exc:
+                error_text = str(exc)
+                if "empty user-facing answer" not in error_text.lower():
+                    raise
+                user_content = self._get_user_message(history) or ""
+                logger.warning("Model returned no user-facing content; trying safe planner fallback for the original request.")
+                return await self._execute_planned_tasks(history, user_content, [])
 
-        # Track execution rounds to prevent infinite loops
-        max_rounds = getattr(self.config, 'automation', None)
-        max_rounds = getattr(max_rounds, 'max_tool_calls', 5) if max_rounds else 5
-        round_count = 0
+            response_text = response if isinstance(response, str) else json.dumps(response, ensure_ascii=False)
+            parsed_response = self._parse_ai_response(response_text)
 
-        # Store tool definitions to persist across rounds
-        tool_definitions = tools
-
-        while round_count < max_rounds:
-            round_count += 1
-            self.current_tool_call_count = 0  # Reset per round
-
-            # Get response from LLM with native tool calling support
-            response = await self.runtime.chat(messages, tools=tool_definitions)
-
-            # Parse response - this now handles ALL formats including XML in content
-            parsed_response = self._parse_ai_response(response)
-
-            # Extract tool calls and content from the parsed response
-            native_tool_calls = []
+            native_tool_calls: List[Dict[str, Any]] = []
             content = ""
-
             if isinstance(parsed_response, dict):
-                # Check for tool calls from native format
-                if "tool_calls" in parsed_response:
-                    native_tool_calls = parsed_response["tool_calls"]
-                content = parsed_response.get("content") or ""
+                calls = parsed_response.get("tool_calls", [])
+                if isinstance(calls, list):
+                    native_tool_calls = calls
+                raw_content = parsed_response.get("content")
+                content = raw_content.strip() if isinstance(raw_content, str) else ""
             elif isinstance(parsed_response, str):
-                # Response was raw text - check for embedded XML calls
-                if "<function" in parsed_response:
-                    native_tool_calls = self._parse_xml_tool_calls(parsed_response)
-                    # Remove XML markup from content
-                    content = self._remove_xml_markup(parsed_response)
-                else:
-                    content = parsed_response
+                content = parsed_response.strip()
+            elif parsed_response is None:
+                # Only use the raw response as visible text when parsing did not
+                # identify a structured tool-call envelope.
+                content = self._remove_xml_markup(response_text).strip() if "<function" in response_text else response_text.strip()
 
-            # If parsed_response was None or empty, use raw response
-            if not content:
-                content = self._remove_xml_markup(response) if "<function" in response else response
+            # Normalize IDs and wire-format arguments once, before both execution
+            # and adding the assistant tool-call message to conversation history.
+            normalized_calls: List[Dict[str, Any]] = []
+            seen_ids = set()
+            for index, call in enumerate(native_tool_calls):
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict) or not function.get("name"):
+                    continue
+                call_id = call.get("id") or f"alice_{round_count}_{index}"
+                if call_id in seen_ids:
+                    continue
+                seen_ids.add(call_id)
+                arguments = function.get("arguments", "{}")
+                if isinstance(arguments, dict):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                elif not isinstance(arguments, str):
+                    arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+                normalized_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": function["name"], "arguments": arguments}
+                })
 
-            # Build combined tool calls list
-            all_tool_calls = []
-            processed_ids = set()
+            if normalized_calls:
+                user_content = self._get_user_message(history) or content
+                if self._is_compound_command(user_content, normalized_calls):
+                    return await self._execute_planned_tasks(history, user_content, normalized_calls)
 
-            # Add XML tool calls first (they have generated IDs)
-            for tc in native_tool_calls:
-                tc_id = tc.get("id", f"xml_{len(all_tool_calls)}")
-                if tc_id not in processed_ids:
-                    all_tool_calls.append(tc)
-                    processed_ids.add(tc_id)
+                tool_results = await self._execute_tool_calls(normalized_calls, messages, content)
+                messages.append({
+                    "role": "assistant",
+                    "content": content or "",
+                    "tool_calls": normalized_calls
+                })
+                messages.extend(tool_results)
+                continue
 
-            if all_tool_calls:
-                # Detect if this is a compound command that should use the planner
-                # Use the original user message from history, not the assistant's content
-                user_content = self._get_user_message(history)
-                if self._is_compound_command(user_content or content, all_tool_calls):
-                    # Use planner for compound commands
-                    return await self._execute_planned_tasks(history, user_content or content, all_tool_calls)
+            if content:
+                return content
 
-                # Execute tool calls and get result
-                result = await self._execute_tool_calls(all_tool_calls, messages, content)
+            # An empty turn with no tool call must never be reported as success.
+            user_content = self._get_user_message(history) or ""
+            if user_content:
+                fallback = await self._execute_planned_tasks(history, user_content, [])
+                if not fallback.lower().startswith("alice could not safely map"):
+                    return fallback
+            return "The model returned an empty reply. No desktop action was performed."
 
-                # Build messages for next iteration
-                assistant_msg = {"role": "assistant", "content": content}
-                if all_tool_calls:
-                    assistant_msg["tool_calls"] = all_tool_calls
-                messages.append(assistant_msg)
-
-                if isinstance(result, list):
-                    messages.extend(result)
-                elif result:
-                    messages.append({"role": "assistant", "content": str(result)})
-
-                # Check if we got a string result (means final response)
-                if isinstance(result, str):
-                    return result
-
-                # Continue loop for next iteration
-            else:
-                # No tool calls found - this is our final response
-                # Content should be clean (no XML markup)
-                return content if content else "Task completed."
+        return (
+            f"ALICE stopped after {max_rounds} model/tool rounds to prevent an endless loop. "
+            "The last tool results are available in the conversation; ask to continue."
+        )
 
     def _get_user_message(self, history: List[Dict[str, str]]) -> Optional[str]:
         """Get the most recent user message from conversation history.
@@ -248,69 +246,66 @@ Only call tools when the user explicitly requests a computer action. For normal 
         return False
 
     async def _execute_planned_tasks(self, history: List[Dict[str, str]], content: str, tool_calls: List[Dict]) -> str:
-        """Execute compound commands using the task planner."""
-        # Build a combined user message from history
-        user_messages = [h for h in history if h.get("role") == "user"]
-        latest_user = user_messages[-1]["content"] if user_messages else content
-
-        # Plan the task
+        """Execute a deterministic plan through the same permission-aware dispatcher."""
+        latest_user = self._get_user_message(history) or content or ""
         steps = self.task_planner.plan(latest_user)
+        if not steps or any(step.tool_name == "general" for step in steps):
+            return (
+                "ALICE could not safely map the request to a supported desktop action. "
+                "No application or text action was performed."
+            )
 
-        # Check permissions and execute steps sequentially
+        self.tool_dispatcher.call_count = 0
         results = []
         for step in steps:
             tool = self.tool_registry.get(step.tool_name)
-            if tool:
-                # Check if step requires confirmation
-                if not self._check_permission(tool):
-                    step.requires_confirmation = True
-                    results.append({
-                        "step_id": step.step_id,
-                        "description": step.description,
-                        "tool": step.tool_name,
-                        "requires_confirmation": True,
-                        "message": f"Step requires user confirmation (category {tool.required_permission})"
-                    })
-                    # Continue with unconfirmed steps for now, or return early
-                    # For now, we'll skip unconfirmed tool calls
-                    continue
+            if tool is None:
+                results.append({
+                    "step": step.description, "tool": step.tool_name,
+                    "status": "error", "message": f"Tool '{step.tool_name}' is not registered."
+                })
+                break
 
-            success = step.execute(self.tool_registry)
-            if success:
-                # Verify step result
-                if step.result:
-                    if isinstance(step.result, dict):
-                        step.verified = step.result.get("status") == "success"
-                    else:
-                        step.verified = bool(step.result)
-            else:
-                step.verified = False
+            if not self._check_permission(tool):
+                step.requires_confirmation = True
+                results.append({
+                    "step": step.description, "tool": step.tool_name,
+                    "status": "blocked",
+                    "message": (
+                        f"Category {tool.required_permission} permission is not enabled. "
+                        "No action was taken for this step."
+                    )
+                })
+                break
 
+            try:
+                result = await self.tool_dispatcher.execute_async(step.tool_name, step.parameters)
+            except Exception as exc:
+                result = {"status": "error", "error": str(exc)}
+            step.result = result
+            status = result.get("status") if isinstance(result, dict) else None
+            step.verified = status in {"success", "navigated", "search_completed", "completed"}
             results.append({
-                "step_id": step.step_id,
-                "description": step.description,
+                "step": step.description,
                 "tool": step.tool_name,
-                "result": step.result,
-                "verified": step.verified,
-                "error": step.error,
-                "requires_confirmation": False
+                "status": "success" if step.verified else "error",
+                "message": (
+                    (result.get("message") or result.get("error") or str(result))
+                    if isinstance(result, dict) else str(result)
+                )
             })
+            # Stop dependent work if opening/focusing the target application failed.
+            if not step.verified:
+                break
 
-        # Build response for final LLM call
-        plan_summary = self.task_planner.get_plan_summary()
-        results_summary = "\n".join(
-            f"- Step {r['step_id']}: {r['description']} - {r['result'] if isinstance(r['result'], dict) else r['result']}"
-            for r in results
-        )
-
-        # Add results to history and get final response
-        # Prepend system prompt at the beginning (it's not in history for planner calls)
-        messages = [{"role": "system", "content": self.system_prompt}] + history + [
-            {"role": "assistant", "content": f"Executed plan: {plan_summary}\nResults:\n{results_summary}"}
-        ]
-
-        final_response = await self.runtime.chat(messages)
-        return final_response
+        succeeded = sum(1 for item in results if item["status"] == "success")
+        lines = [f"Completed {succeeded} of {len(steps)} planned step(s)."]
+        lines.extend(f"- {item['step']}: {item['message']}" for item in results)
+        if results and results[-1]["status"] == "blocked":
+            lines.append("ALICE stopped because this action requires permission; it did not claim the step was completed.")
+        elif succeeded < len(steps):
+            lines.append("ALICE stopped after a failed step; dependent actions were not attempted.")
+        return "\n".join(lines)
 
     def _parse_ai_response(self, response: str) -> Optional[Dict[str, Any]]:
         """Parse AI response, handling multiple formats.
@@ -705,124 +700,75 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         return normalized
 
-    async def _execute_tool_calls(self, tool_calls: List[Dict], history: List[Dict[str, str]], assistant_content: str = "") -> str:
-        """Execute tool calls and return results to LLM for final response."""
-        tool_results = []
+    async def _execute_tool_calls(self, tool_calls: List[Dict], history: List[Dict[str, str]], assistant_content: str = "") -> List[Dict[str, str]]:
+        """Execute one model tool-call round and return its matching tool messages.
 
-        for call in tool_calls:
-            if call.get("type") != "function":
+        The caller owns the conversation loop and feeds the results back to the
+        model. This method deliberately does not make a second model call.
+        """
+        tool_results: List[Dict[str, str]] = []
+        for index, call in enumerate(tool_calls):
+            if not isinstance(call, dict):
                 continue
+            function = call.get("function") or {}
+            tool_name = function.get("name")
+            call_id = call.get("id") or f"alice_tool_{index}"
+            arguments_value = function.get("arguments", "{}")
 
-            func = call.get("function", {})
-            tool_name = func.get("name")
-            arguments_str = func.get("arguments", "{}")
-            call_id = call.get("id", "call_1")
-
-            # LM Studio may return function arguments as either a JSON string
-            # (OpenAI-compatible wire format) or an already-decoded dictionary.
-            # Never pass a dict to json.loads(), and never silently execute a
-            # malformed/non-object argument payload with empty arguments.
-            if isinstance(arguments_str, dict):
-                arguments = arguments_str
-            elif isinstance(arguments_str, str):
+            if isinstance(arguments_value, dict):
+                arguments = arguments_value
+            elif isinstance(arguments_value, str):
                 try:
-                    arguments = json.loads(arguments_str or "{}")
+                    arguments = json.loads(arguments_value or "{}")
                 except json.JSONDecodeError as exc:
                     tool_results.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": json.dumps({
-                            "status": "error",
-                            "error": f"Invalid JSON arguments for {tool_name}: {exc}"
-                        })
+                        "role": "tool", "tool_call_id": call_id,
+                        "content": json.dumps({"status": "error", "error": f"Invalid JSON arguments for {tool_name}: {exc}"})
                     })
                     continue
-            elif arguments_str is None:
+            elif arguments_value is None:
                 arguments = {}
             else:
                 tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": json.dumps({
-                        "status": "error",
-                        "error": f"Unsupported argument type for {tool_name}: {type(arguments_str).__name__}"
-                    })
+                    "role": "tool", "tool_call_id": call_id,
+                    "content": json.dumps({"status": "error", "error": f"Unsupported arguments type: {type(arguments_value).__name__}"})
                 })
                 continue
 
             if not isinstance(arguments, dict):
                 tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": json.dumps({
-                        "status": "error",
-                        "error": f"Arguments for {tool_name} must be a JSON object, got {type(arguments).__name__}"
-                    })
+                    "role": "tool", "tool_call_id": call_id,
+                    "content": json.dumps({"status": "error", "error": "Tool arguments must be a JSON object."})
                 })
                 continue
 
-            # Normalize parameter names to match tool signatures
             arguments = self._normalize_tool_arguments(tool_name, arguments)
-
-            # Check permissions
+            # Do not let a generic open_app call open the user's unrelated
+            # default Chrome session. All Chrome launches go through ALICE's
+            # separately managed, persistent profile.
+            if tool_name == "open_app":
+                requested_app = str(arguments.get("app_name") or arguments.get("app") or "").strip().lower()
+                if requested_app in {"chrome", "google chrome"}:
+                    tool_name = "browser_open"
+                    arguments = {"url": "https://www.google.com/"}
             tool = self.tool_registry.get(tool_name)
-            if tool:
-                if not self._check_permission(tool):
-                    tool_results.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": json.dumps({
-                            "status": "error",
-                            "error": f"Permission denied for tool {tool_name} (category {tool.required_permission})"
-                        })
-                    })
-                    continue
-
-            # Execute tool through dispatcher (handles async tools properly)
-            if tool:
-                result = await self.tool_dispatcher.execute_async(tool_name, arguments)
+            if tool is None:
+                result = {"status": "error", "error": f"Tool '{tool_name}' not found"}
+            elif not self._check_permission(tool):
+                result = {
+                    "status": "blocked",
+                    "error": f"Permission denied for tool {tool_name} (category {tool.required_permission})."
+                }
             else:
-                result = {"status": "error", "error": f"Tool {tool_name} not found"}
+                result = await self.tool_dispatcher.execute_async(tool_name, arguments)
 
             tool_results.append({
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": json.dumps(result)
+                "content": json.dumps(result, ensure_ascii=False, default=str)
             })
 
-        # Send tool results back to LLM for final response
-        # Use OpenAI-compatible format: tool_calls at message level, not inside content
-        # Ensure arguments are properly formatted as JSON strings for the API
-        formatted_tool_calls = []
-        for tc in tool_calls:
-            formatted_call = {
-                "id": tc.get("id"),
-                "type": tc.get("type"),
-                "function": {
-                    "name": tc.get("function", {}).get("name"),
-                    "arguments": tc.get("function", {}).get("arguments", {})
-                }
-            }
-            # Ensure arguments are a JSON string (OpenAI format)
-            if isinstance(formatted_call["function"]["arguments"], dict):
-                formatted_call["function"]["arguments"] = json.dumps(formatted_call["function"]["arguments"])
-            formatted_tool_calls.append(formatted_call)
-
-        if assistant_content:
-            # Assistant has both content and tool calls
-            assistant_message = {"role": "assistant", "content": assistant_content, "tool_calls": formatted_tool_calls}
-        else:
-            # Assistant only has tool calls (no text content)
-            # Use empty string for content when only tool_calls are present
-            assistant_message = {"role": "assistant", "content": "", "tool_calls": formatted_tool_calls}
-
-        # history already contains the system prompt at index 0, so use it directly
-        messages = history + [
-            assistant_message
-        ] + tool_results
-
-        final_response = await self.runtime.chat(messages)
-        return final_response
+        return tool_results
 
     def _check_permission(self, tool) -> bool:
         """Check if tool execution is permitted based on automation config.
@@ -848,51 +794,45 @@ Only call tools when the user explicitly requests a computer action. For normal 
         return True
 
     async def execute_intent(self, user_intent: str) -> Dict[str, Any]:
-        """Execute a user intent using the task planner."""
+        """Execute a user intent through the permission-aware async dispatcher."""
         steps = self.task_planner.plan(user_intent)
-
-        # Check permissions and execute steps sequentially
+        self.tool_dispatcher.call_count = 0
         results = []
         for step in steps:
             tool = self.tool_registry.get(step.tool_name)
-            if tool:
-                # Check if step requires confirmation
-                if not self._check_permission(tool):
-                    step.requires_confirmation = True
-                    results.append({
-                        "step_id": step.step_id,
-                        "description": step.description,
-                        "tool": step.tool_name,
-                        "requires_confirmation": True,
-                        "message": f"Step requires user confirmation (category {tool.required_permission})"
-                    })
-                    break  # Stop for confirmation
-
-            success = step.execute(self.tool_registry)
-            if success:
-                # Verify step result
-                if step.result:
-                    if isinstance(step.result, dict):
-                        step.verified = step.result.get("status") == "success"
-                    else:
-                        step.verified = bool(step.result)
-            else:
-                step.verified = False
-
+            if tool is None:
+                results.append({
+                    "step_id": step.step_id, "description": step.description,
+                    "tool": step.tool_name, "verified": False,
+                    "error": f"Tool '{step.tool_name}' not found",
+                    "requires_confirmation": False
+                })
+                break
+            if not self._check_permission(tool):
+                results.append({
+                    "step_id": step.step_id, "description": step.description,
+                    "tool": step.tool_name, "verified": False, "result": None,
+                    "error": f"Permission required for category {tool.required_permission}",
+                    "requires_confirmation": True
+                })
+                break
+            result = await self.tool_dispatcher.execute_async(step.tool_name, step.parameters)
+            step.result = result
+            step.verified = isinstance(result, dict) and result.get("status") in {
+                "success", "navigated", "search_completed", "completed"
+            }
             results.append({
-                "step_id": step.step_id,
-                "description": step.description,
-                "tool": step.tool_name,
-                "result": step.result,
+                "step_id": step.step_id, "description": step.description,
+                "tool": step.tool_name, "result": result,
                 "verified": step.verified,
-                "error": step.error,
+                "error": None if step.verified else (
+                    result.get("error", "Step did not complete") if isinstance(result, dict) else "Step did not complete"
+                ),
                 "requires_confirmation": False
             })
-
-        return {
-            "plan": self.task_planner.get_plan_summary(),
-            "steps": results
-        }
+            if not step.verified:
+                break
+        return {"plan": self.task_planner.get_plan_summary(), "steps": results}
 
     async def shutdown_async(self) -> None:
         if self.initialized:

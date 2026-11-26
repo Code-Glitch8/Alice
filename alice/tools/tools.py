@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import time
 from typing import Optional, Dict, Any, List
 from pathlib import Path
@@ -128,6 +129,11 @@ class CloseAppTool(Tool):
                 "verification": {"processes_closed": 0},
                 "error": "Missing required parameter: app_name or app"
             }
+        # Chrome launched by ALICE uses a dedicated persistent profile. Never
+        # terminate the user's unrelated default-profile Chrome windows.
+        if str(app_name).strip().lower() in {"chrome", "google chrome"}:
+            return BrowserOpenTool.close_owned_browser()
+
         try:
             from alice.computer.engine import ComputerEngine
             from alice.core.config import Config
@@ -304,118 +310,184 @@ class SearchFilesTool(Tool):
 
 
 class BrowserOpenTool(Tool):
-    """Open browser with URL or search using Playwright."""
+    """Open a search or URL in ALICE's persistent, non-Incognito Chrome profile."""
+
+    _managed_profile_dir: Optional[str] = None
 
     def __init__(self):
-        super().__init__("browser_open", "Open browser or perform search", required_permission="A")
+        super().__init__("browser_open", "Open Google Chrome or perform a web search", required_permission="A")
+
+    @classmethod
+    def _resolve_profile_dir(cls) -> Path:
+        """Return a persistent profile directory reserved exclusively for ALICE."""
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            root = Path(local_app_data)
+        else:
+            root = Path.home() / "AppData" / "Local"
+        return root / "ALICE" / "ChromeProfile"
+
+    def _find_chrome_executable(self) -> Optional[str]:
+        """Find the installed Chrome executable."""
+        candidates = []
+        for root_var, suffix in (
+            ("PROGRAMFILES", r"Google\Chrome\Application\chrome.exe"),
+            ("PROGRAMFILES(X86)", r"Google\Chrome\Application\chrome.exe"),
+            ("LOCALAPPDATA", r"Google\Chrome\Application\chrome.exe"),
+        ):
+            root = os.environ.get(root_var)
+            if root:
+                candidates.append(Path(root) / suffix)
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        return shutil.which("chrome.exe") or shutil.which("chrome")
+
+    def _launch_chrome(self, url: Optional[str] = None, search: Optional[str] = None) -> dict:
+        """Open Chrome with ALICE's separate, persistent regular browser profile."""
+        from urllib.parse import urlencode, urlparse
+
+        if search and not url:
+            query = str(search).strip()
+            if not query:
+                return {"status": "error", "action": "browser_open", "error": "Search query is empty."}
+            target_url = "https://www.google.com/search?" + urlencode({"q": query})
+        elif url:
+            target_url = str(url).strip()
+            parsed = urlparse(target_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                return {"status": "error", "action": "browser_open", "error": "URL must use http:// or https://."}
+        else:
+            return {"status": "error", "action": "browser_open", "error": "Provide a URL or search query."}
+
+        chrome_path = self._find_chrome_executable()
+        if not chrome_path:
+            return {
+                "status": "error", "action": "browser_open", "url": target_url,
+                "error": "Google Chrome was not found. Install Chrome or add chrome.exe to PATH."
+            }
+
+        profile_dir = self._resolve_profile_dir()
+        try:
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            type(self)._managed_profile_dir = str(profile_dir.resolve())
+            creation_flags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+            launch_kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "close_fds": True,
+            }
+            if creation_flags:
+                launch_kwargs["creationflags"] = creation_flags
+
+            # This profile is stored under LocalAppData and reused between ALICE
+            # sessions. It is a normal Chrome profile, not an Incognito session.
+            # It is separate so that ALICE can close only its own Chrome windows.
+            command = [
+                chrome_path,
+                f"--user-data-dir={profile_dir}",
+                "--new-window",
+                "--no-first-run",
+                target_url
+            ]
+            process = subprocess.Popen(command, **launch_kwargs)
+            return {
+                "status": "success",
+                "action": "browser_open",
+                "browser": "Google Chrome",
+                "search": search,
+                "url": target_url,
+                "profile": str(profile_dir),
+                "message": "Opened Google Chrome in ALICE's persistent regular profile (not Incognito). Future searches reuse this profile.",
+                "verification": {
+                    "launch_requested": True,
+                    "incognito": False,
+                    "dedicated_profile": True,
+                    "profile_dir": str(profile_dir),
+                    "pid": getattr(process, "pid", None)
+                },
+                "error": None
+            }
+        except Exception as exc:
+            logger.exception("Could not launch Google Chrome")
+            return {"status": "error", "action": "browser_open", "url": target_url, "error": str(exc)}
+
+    @classmethod
+    def close_owned_browser(cls) -> dict:
+        """Close only Chrome processes using ALICE's dedicated profile."""
+        profile_dir = cls._managed_profile_dir or str(cls._resolve_profile_dir())
+        target_profile = os.path.normcase(os.path.abspath(profile_dir))
+        try:
+            import psutil
+            matches = []
+            for process in psutil.process_iter(["name", "cmdline"]):
+                try:
+                    name = (process.info.get("name") or "").lower()
+                    if "chrome" not in name:
+                        continue
+                    command_line = process.info.get("cmdline") or []
+                    for argument in command_line:
+                        if not isinstance(argument, str) or not argument.lower().startswith("--user-data-dir="):
+                            continue
+                        candidate = argument.split("=", 1)[1].strip('"')
+                        if os.path.normcase(os.path.abspath(candidate)) == target_profile:
+                            matches.append(process)
+                            break
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+
+            if not matches:
+                return {
+                    "status": "success",
+                    "action": "close_app",
+                    "app": "chrome",
+                    "message": "No ALICE-managed Chrome session is running; other Chrome windows were left untouched.",
+                    "verification": {"closed_processes": 0}
+                }
+
+            for process in matches:
+                try:
+                    process.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            gone, alive = psutil.wait_procs(matches, timeout=4)
+            for process in alive:
+                try:
+                    process.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            cls._managed_profile_dir = None
+            return {
+                "status": "success",
+                "action": "close_app",
+                "app": "chrome",
+                "message": f"Closed the ALICE-managed Chrome profile ({len(gone) + len(alive)} process(es)). Other Chrome profiles were left untouched.",
+                "verification": {"closed_processes": len(gone) + len(alive)}
+            }
+        except ImportError:
+            return {
+                "status": "error",
+                "action": "close_app",
+                "app": "chrome",
+                "error": "psutil is required to safely close only the ALICE-managed Chrome profile."
+            }
+        except Exception as exc:
+            logger.exception("Could not close the ALICE-managed Chrome profile")
+            return {"status": "error", "action": "close_app", "app": "chrome", "error": str(exc)}
 
     def execute(self, **kwargs) -> dict:
-        """Execute browser open/search.
+        """Launch Chrome visibly; the persistent browser profile outlives this call."""
+        return self._launch_chrome(kwargs.get("url"), kwargs.get("search"))
 
-        If search is provided and no URL, performs a web search.
-        If URL is provided, navigates to it.
-        Returns status dict with execution result.
-        """
-        url = kwargs.get("url")
-        search = kwargs.get("search")
-        visible = kwargs.get("visible", False)  # New parameter for visible mode
-        try:
-            import asyncio
-
-            # Always use run_until_complete with a new loop for synchronous execution
-            # This ensures we wait for the browser to complete before returning
-            try:
-                loop = asyncio.get_running_loop()
-                # We're in an async context, need to create a task and wait for it
-                # Use asyncio.run() for clean async execution in async context
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, self._browser_open_async(url, search, visible))
-                    result = future.result(timeout=30)  # 30 second timeout for browser operations
-                return result
-            except RuntimeError:
-                # No running loop, use standard approach
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    result = loop.run_until_complete(self._browser_open_async(url, search, visible))
-                    return result
-                finally:
-                    loop.close()
-        except Exception as e:
-            logger.error(f"Browser open error: {e}")
-            return {"status": "error", "error": str(e)}
-
-    async def _browser_open_async(self, url: Optional[str] = None, search: Optional[str] = None, visible: bool = False) -> dict:
-        """Async browser open using Playwright.
-
-        Browser remains open for user interaction after initial load.
-        Uses persistent context (not incognito) for Chrome in normal mode.
-        """
-        try:
-            from playwright.async_api import async_playwright
-
-            async with async_playwright() as p:
-                # Launch browser in normal mode (not incognito/private)
-                # headless=False if visible=True, otherwise headless
-                browser = await p.chromium.launch(headless=not visible, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
-
-                # Use persistent context for normal browsing mode (not incognito)
-                # This makes Chrome open in normal user profile mode
-                context = await browser.new_context()
-                page = await context.new_page()
-
-                if search and not url:
-                    query = search if isinstance(search, str) else str(search)
-                    # Use browser_open with search parameter properly
-                    search_url = f"https://www.google.com/search?q={query}"
-                    await page.goto(search_url)
-                    await page.wait_for_load_state("networkidle")
-                    title = await page.title()
-                    current_url = page.url
-                    # Keep browser open for user interaction - do NOT close
-                    return {
-                        "status": "search_completed",
-                        "action": "browser_open",
-                        "search": query,
-                        "url": current_url,
-                        "title": title,
-                        "verification": {"page_loaded": True, "browser_open": True},
-                        "error": None,
-                        "browser_context": "persistent",
-                        "message": "Browser opened and search completed. Browser remains open for interaction."
-                    }
-                elif url:
-                    await page.goto(url)
-                    await page.wait_for_load_state("networkidle")
-                    title = await page.title()
-                    current_url = page.url
-                    # Keep browser open for user interaction - do NOT close
-                    return {
-                        "status": "navigated",
-                        "action": "browser_open",
-                        "url": url,
-                        "title": title,
-                        "url": current_url,
-                        "verification": {"page_loaded": True, "browser_open": True},
-                        "error": None,
-                        "browser_context": "persistent",
-                        "message": "Browser opened and page navigated. Browser remains open for interaction."
-                    }
-                else:
-                    # Keep browser open for user interaction
-                    return {
-                        "status": "idle",
-                        "action": "browser_open",
-                        "verification": {"browser_open": True},
-                        "error": "No URL or search provided",
-                        "message": "Browser is ready for interaction."
-                    }
-        except ImportError:
-            return {"status": "error", "error": "playwright not installed"}
-        except Exception as e:
-            logger.error(f"Browser async error: {e}")
-            return {"status": "error", "error": str(e)}
+    async def _browser_open_async(self, url: Optional[str] = None, search: Optional[str] = None, visible: bool = True) -> dict:
+        """Async-compatible wrapper retained for existing callers and tests."""
+        return await asyncio.to_thread(self._launch_chrome, url, search)
 
 
 class BrowserExtractTool(Tool):
@@ -685,89 +757,65 @@ class GetAppStatusTool(Tool):
 
 
 class TypeTextTool(Tool):
-    """Type text into the active window using reliable clipboard paste method."""
+    """Paste text into a deliberately focused target window."""
 
     def __init__(self):
         super().__init__("type_text", "Type text into the active window", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
         text = kwargs.get("text", "")
-        delay = kwargs.get("delay", 0)
+        delay = max(0.0, float(kwargs.get("delay", 0) or 0))
         target_window = kwargs.get("target_window")
-        interval = kwargs.get("interval", 0)
-
-        if not text:
-            return {"status": "error", "error": "Missing required parameter: text"}
+        if not isinstance(text, str) or not text:
+            return {"status": "error", "action": "type_text", "error": "Missing required parameter: text"}
 
         try:
-            import pyautogui
+            import time
             from alice.computer.engine import ComputerEngine
             from alice.tools.clipboard_utils import set_text_to_clipboard
 
-            # Focus target window if specified or auto-detect
             engine = ComputerEngine()
             if target_window:
-                success, msg = engine.focus_app(target_window)
+                focused, focus_message = engine.focus_app(str(target_window))
             else:
-                # Auto-focus: bring the most recently interacted app to front
-                success = engine.auto_focus_most_relevant()
+                focused = engine.auto_focus_most_relevant()
+                focus_message = "Focused the most recently relevant application" if focused else "No target window could be focused"
 
-            # Ensure window has focus with proper wait
-            if success:
-                import time
-                time.sleep(0.3)
+            # Never paste into an arbitrary foreground window after a failed focus.
+            if not focused:
+                return {
+                    "status": "error",
+                    "action": "type_text",
+                    "target_window": target_window,
+                    "message": focus_message,
+                    "error": f"Could not focus the requested target window: {target_window or 'active application'}"
+                }
 
-            if delay > 0:
-                import time
-                time.sleep(delay)
-
-            # Use clipboard paste method for reliable typing
-            # This is more reliable than pyautogui.typewrite() which can fail
+            time.sleep(max(0.3, delay))
             result = set_text_to_clipboard(text, target_window=target_window)
+            if result.get("status") != "success":
+                return {
+                    "status": "error",
+                    "action": "type_text",
+                    "target_window": target_window,
+                    "message": "Text was not pasted.",
+                    "error": result.get("error", "Clipboard paste failed")
+                }
 
-            if result.get("status") == "success":
-                # Verify focus is correct
-                verification = result.get("verification", {"success": True})
-                return {
-                    "status": "success",
-                    "action": "type_text",
-                    "text": text,
-                    "target_window": target_window,
-                    "message": f"Typed text into {'window: ' + target_window if target_window else 'active window'}",
-                    "result": {"typed": len(text), "method": "clipboard_paste"},
-                    "verification": verification,
-                    "error": None
-                }
-            else:
-                # Fallback to pyautogui if clipboard method fails
-                pyautogui.typewrite(text, interval=interval)
-                return {
-                    "status": "success",
-                    "action": "type_text",
-                    "text": text,
-                    "target_window": target_window,
-                    "message": f"Typed text into {'window: ' + target_window if target_window else 'active window'} (direct)",
-                    "result": {"typed": len(text), "method": "direct_typing"},
-                    "verification": {"success": True, "method": "direct_typing"},
-                    "error": None
-                }
-        except ImportError:
-            # Fallback to basic typing if pyautogui not available
-            import pyautogui
-            pyautogui.typewrite(text, interval=interval)
             return {
                 "status": "success",
                 "action": "type_text",
-                "text": text,
                 "target_window": target_window,
-                "message": f"Typed text (pyautogui fallback) into {'window: ' + target_window if target_window else 'active window'}",
-                "result": {"typed": len(text)},
-                "verification": {"success": True, "method": "pyautogui_fallback"},
+                "message": f"Sent the paste shortcut to the focused window{': ' + str(target_window) if target_window else ''}.",
+                "result": {"characters": len(text), "method": "clipboard_paste"},
+                "verification": {"focus_confirmed": True, "paste_shortcut_sent": True},
                 "error": None
             }
-        except Exception as e:
-            logger.error(f"TypeTextTool error: {e}")
-            return {"status": "error", "error": str(e)}
+        except ImportError as exc:
+            return {"status": "error", "action": "type_text", "error": f"Missing automation dependency: {exc}"}
+        except Exception as exc:
+            logger.exception("TypeTextTool error")
+            return {"status": "error", "action": "type_text", "error": str(exc)}
 
 
 class KeyboardShortcutTool(Tool):
@@ -1048,7 +1096,7 @@ class ToolDispatcher:
             return {"status": "error", "error": str(e)}
 
     async def execute_async(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a tool asynchronously."""
+        """Execute a tool asynchronously without blocking the chat event loop."""
         tool = self.tool_registry.get(tool_name)
         if not tool:
             return {"status": "error", "error": f"Tool '{tool_name}' not found"}
@@ -1058,16 +1106,16 @@ class ToolDispatcher:
             return {"status": "error", "error": f"Exceeded maximum tool calls ({self.max_tool_calls})"}
 
         try:
-            # Check if tool has async implementation
-            async_method = getattr(tool, '_execute_async', None)
-            if async_method:
+            async_method = getattr(tool, "_execute_async", None)
+            if callable(async_method):
                 result = await async_method(**arguments)
             else:
-                result = tool.execute(**arguments)
-            return result
-        except Exception as e:
-            logger.error(f"Async tool execution error for {tool_name}: {e}")
-            return {"status": "error", "error": str(e)}
+                result = await asyncio.to_thread(tool.execute, **arguments)
+            return result if isinstance(result, dict) else {"status": "success", "result": result}
+        except Exception as exc:
+            logger.exception("Async tool execution error for %s", tool_name)
+            return {"status": "error", "error": str(exc)}
+
 
 
 def create_default_tools() -> ToolRegistry:

@@ -17,7 +17,7 @@ Tests all 14 root cause fixes:
 import json
 import asyncio
 import unittest
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from alice.core.application import AliceApplication
 from alice.ai.lmstudio_adapter import LMStudioAdapter
@@ -205,8 +205,8 @@ class TestPlannerIntegration(unittest.TestCase):
 
         steps = app.task_planner.plan("Open Chrome and search for Python")
 
-        self.assertEqual(steps[0].tool_name, 'open_app')
-        # Should handle the browser_open as a separate step or through the planner
+        self.assertEqual(steps[0].tool_name, 'browser_open')
+        self.assertEqual(steps[0].parameters['search'], 'Python')
 
 
 class TestBrowserLifecycle(unittest.TestCase):
@@ -223,12 +223,21 @@ class TestBrowserLifecycle(unittest.TestCase):
         from alice.tools.tools import BrowserOpenTool
 
         tool = BrowserOpenTool()
-        # Run async test
-        result = asyncio.run(tool._browser_open_async(url="https://example.com", visible=True))
+        # Verify the Chrome launch request without requiring Chrome on the CI runner.
+        tool._find_chrome_executable = lambda: r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        with patch("alice.tools.tools.subprocess.Popen") as popen:
+            popen.return_value.pid = 1234
+            result = asyncio.run(tool._browser_open_async(search="Google ai studio", visible=True))
 
-        self.assertEqual(result['status'], 'navigated')
-        self.assertTrue(result['verification']['page_loaded'])
-        # Browser should remain open for further interaction in real usage
+        self.assertEqual(result['status'], 'success')
+        self.assertTrue(result['verification']['launch_requested'])
+        self.assertTrue(result['verification']['dedicated_profile'])
+        self.assertFalse(result['verification']['incognito'])
+        command = popen.call_args.args[0]
+        self.assertIn("chrome.exe", command[0].lower())
+        self.assertTrue(command[1].startswith("--user-data-dir="))
+        self.assertIn("q=Google+ai+studio", command[-1])
+        self.assertNotIn("--incognito", command)
 
 
 class TestAsyncExecution(unittest.TestCase):
@@ -294,14 +303,18 @@ class TestToolExecutionLoop(unittest.TestCase):
                 return final_response
 
         app.runtime.chat = mock_chat
+        app.initialized = True
 
-        # Also need to mock _execute_tool_calls since we don't want actual tool execution
+        # Return proper OpenAI-style tool result messages.
         async def mock_execute_tool_calls(tool_calls, history, content):
-            return {"status": "success", "tool_calls_executed": len(tool_calls)}
+            return [
+                {"role": "tool", "tool_call_id": call["id"], "content": json.dumps({"status": "success"})}
+                for call in tool_calls
+            ]
 
         app._execute_tool_calls = mock_execute_tool_calls
 
-        result = asyncio.run(app.chat_with_tools([{"role": "user", "content": "Open notepad and chrome"}]))
+        result = asyncio.run(app.chat_with_tools([{"role": "user", "content": "Open notepad"}]))
         # Should contain something about executing the tool calls
         self.assertIsNotNone(result)
 
@@ -439,6 +452,8 @@ class TestSystemPromptDuplication(unittest.TestCase):
                 return "Task completed successfully"
 
         app.runtime.chat = mock_chat
+        app.initialized = True
+        app.tool_dispatcher.execute_async = AsyncMock(return_value={"status": "success", "message": "Opened Notepad"})
 
         # Execute the chat with tools
         result = asyncio.run(app.chat_with_tools([{"role": "user", "content": "Open notepad"}]))
@@ -505,9 +520,12 @@ class TestSystemPromptDuplication(unittest.TestCase):
                 return "All tasks completed"
 
         app.runtime.chat = mock_chat
+        app.initialized = True
+        app.tool_dispatcher.execute_async = AsyncMock(return_value={"status": "success", "message": "Action completed"})
 
-        # Execute
-        result = asyncio.run(app.chat_with_tools([{"role": "user", "content": "Open notepad and type Hello"}]))
+        # Keep the originating request non-compound so this exercises the iterative
+        # native-tool-call loop rather than deterministic planning.
+        result = asyncio.run(app.chat_with_tools([{"role": "user", "content": "Open notepad"}]))
 
         # Check all calls for system prompt duplication
         for i, messages in enumerate(messages_sent_to_runtime):

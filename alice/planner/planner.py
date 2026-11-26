@@ -66,37 +66,41 @@ class TaskPlanner:
         self.steps: List[TaskStep] = []
 
     def plan(self, user_intent: str) -> List[TaskStep]:
-        """Break down user intent into ordered steps."""
-        steps = []
-
+        """Break down user intent into ordered, executable steps."""
         intent_lower = user_intent.lower()
 
-        # Detect intent type and break down accordingly
-        if any(kw in intent_lower for kw in ["open", "launch", "start"]):
-            steps.extend(self._plan_open_app(user_intent))
+        # A search command that mentions Chrome is one browser operation:
+        # launching Chrome and passing it the requested search URL. Check this
+        # before the generic open-app branch so the query is not discarded.
+        if "search for " in intent_lower or "search the web for " in intent_lower or "search web for " in intent_lower:
+            steps = self._plan_browser_search(user_intent)
         elif any(kw in intent_lower for kw in ["download "]):
-            steps.extend(self._plan_browser_download(user_intent))
+            steps = self._plan_browser_download(user_intent)
         elif any(kw in intent_lower for kw in ["screenshot", "capture "]):
-            steps.extend(self._plan_browser_screenshot(user_intent))
+            steps = self._plan_browser_screenshot(user_intent)
         elif any(kw in intent_lower for kw in ["extract from ", "summarize ", "read page", "get content"]):
-            steps.extend(self._plan_browser_extract(user_intent))
-        elif any(kw in intent_lower for kw in ["browser", "search chrome", "search web", "search for "]):
-            steps.extend(self._plan_browser_search(user_intent))
+            steps = self._plan_browser_extract(user_intent)
+        elif any(kw in intent_lower for kw in ["close ", "quit ", "exit "]):
+            steps = self._plan_close_app(user_intent)
+        elif any(kw in intent_lower for kw in ["open", "launch", "start"]) and "chrome" in intent_lower:
+            steps = [TaskStep(
+                1, "Open Google Chrome", "browser_open",
+                {"url": "https://www.google.com/", "visible": True}
+            )]
+        elif any(kw in intent_lower for kw in ["open", "launch", "start"]):
+            steps = self._plan_open_app(user_intent)
+        elif any(kw in intent_lower for kw in ["browser", "search chrome", "search web"]):
+            steps = self._plan_browser_search(user_intent)
         elif any(kw in intent_lower for kw in ["find", "look for"]):
-            steps.extend(self._plan_search_files(user_intent))
+            steps = self._plan_search_files(user_intent)
         elif any(kw in intent_lower for kw in ["create", "make"]):
-            steps.extend(self._plan_create(user_intent))
+            steps = self._plan_create(user_intent)
         elif any(kw in intent_lower for kw in ["extract", "unzip"]):
-            steps.extend(self._plan_extract_zip(user_intent))
+            steps = self._plan_extract_zip(user_intent)
         elif any(kw in intent_lower for kw in ["help", "explain"]):
-            steps.extend(self._plan_general_help(user_intent))
+            steps = self._plan_general_help(user_intent)
         else:
-            # Default: ask for clarification
-            steps.append(TaskStep(
-                1, user_intent,
-                "general", {"intent": user_intent},
-                requires_confirmation=True
-            ))
+            steps = [TaskStep(1, user_intent, "general", {"intent": user_intent}, requires_confirmation=True)]
 
         self.steps = steps
         return steps
@@ -105,7 +109,7 @@ class TaskPlanner:
         """Extract application name from user intent."""
         intent = intent.lower().strip()
         # Remove common prefixes
-        for prefix in ["open ", "launch ", "start "]:
+        for prefix in ["open ", "launch ", "start ", "close ", "quit ", "exit "]:
             if intent.startswith(prefix):
                 intent = intent[len(prefix):]
                 break
@@ -118,67 +122,49 @@ class TaskPlanner:
 
         return intent.strip()
 
-    def _plan_open_app(self, intent: str) -> List[TaskStep]:
-        """Plan opening an application."""
-        import re
+    def _plan_close_app(self, intent: str) -> List[TaskStep]:
+        """Plan closing an application through its registered ownership-aware tool."""
         app_name = self._extract_app_name(intent)
-        steps = [
-            TaskStep(
-                1, f"Open {app_name}",
-                "open_app", {"app_name": app_name}
-            )
+        return [
+            TaskStep(1, f"Close {app_name}", "close_app", {"app_name": app_name},
+                     requires_confirmation=True)
         ]
 
-        # Check if intent includes typing text
-        # Match both quoted: type 'text' and unquoted: type text
+    def _plan_open_app(self, intent: str) -> List[TaskStep]:
+        """Plan opening an application and optional text entry/save actions."""
+        import re
+
+        app_name = self._extract_app_name(intent)
+        steps = [TaskStep(1, f"Open {app_name}", "open_app", {"app_name": app_name})]
+
+        # Accept quoted and plain-language typing/writing requests. Preserve the
+        # whole unquoted phrase until a trailing "save as" clause, when present.
         text = None
-        type_match = re.search(r"type\s+'([^']+)'", intent)
-        if type_match:
-            text = type_match.group(1)
-        else:
-            # Try unquoted format: "type <something> , save as" pattern
-            unquoted_match = re.search(r'type\s+([a-zA-Z\s\.\!\?]+?)(?:,\s*save|\s+,\s*save|\s+and\s+save)', intent)
-            if unquoted_match:
-                text = unquoted_match.group(1).strip().rstrip(',')
+        write_match = re.search(
+            r"\b(?:type|write|enter)\s+(?:\"([^\"]+)\"|'([^']+)'|(.+?))(?=\s*(?:,?\s*(?:and\s+)?save\s+as\b|$))",
+            intent,
+            flags=re.IGNORECASE | re.DOTALL
+        )
+        if write_match:
+            text = next((part for part in write_match.groups() if part is not None), "").strip()
+            text = text.rstrip(" .!?")
+            if text:
+                steps.append(TaskStep(
+                    2, f"Focus {app_name}", "focus_app", {"app_name": app_name}
+                ))
+                steps.append(TaskStep(
+                    3, f"Write text in {app_name}", "type_text",
+                    {"text": text, "target_window": app_name}
+                ))
 
-        if text:
-            # Focus the app before typing
-            steps.append(TaskStep(
-                2, f"Focus {app_name}",
-                "focus_app", {"app_name": app_name}
-            ))
-            steps.append(TaskStep(
-                3, f"Type '{text}'",
-                "type_text", {"text": text}
-            ))
-
-        # Check if intent includes saving
-        save_match = re.search(r'save\s+as\s+([^\s,]+)', intent)
+        save_match = re.search(r"\bsave\s+as\s+([^\s,]+)", intent, flags=re.IGNORECASE)
         if save_match:
             filename = save_match.group(1)
-            # Expand user paths like ~ or %USERPROFILE%
             from pathlib import Path
-            if "desktop" in intent.lower() or "desktop" in filename.lower():
-                path = str(Path.home() / "Desktop" / filename)
-            else:
-                path = filename
-
-            # Get the text that was typed (if any) to use as content
-            if text:
-                content = text
-            else:
-                # Default content for saving
-                content = "Hello from ALICE"
-
-            # Determine step number based on whether we added focus/type steps
-            if text:
-                step_num = 4  # Open, Focus, Type, Save
-            else:
-                step_num = 2  # Open, Save
-
+            path = str(Path.home() / "Desktop" / filename) if "desktop" in intent.lower() else filename
             steps.append(TaskStep(
-                step_num, f"Save as {filename}",
-                "save_file", {"path": path, "content": content}
+                len(steps) + 1, f"Save as {filename}", "save_file",
+                {"path": path, "content": text or "Hello from ALICE"}
             ))
 
         return steps
@@ -211,12 +197,20 @@ class TaskPlanner:
         ]
 
     def _plan_browser_search(self, intent: str) -> List[TaskStep]:
-        """Plan browser search."""
+        """Plan a browser search using only the requested search terms."""
+        import re
+
+        match = re.search(
+            r"\bsearch(?:\s+the\s+web)?\s+for\s+(.+?)(?:\s+in\s+(?:chrome|google\s+chrome))?[.!?]*$",
+            intent,
+            flags=re.IGNORECASE | re.DOTALL
+        )
+        query = match.group(1).strip() if match else intent.strip()
+        if len(query) >= 2 and query[0] == query[-1] and query[0] in {"'", '"'}:
+            query = query[1:-1].strip()
         return [
-            TaskStep(
-                1, "Browser search",
-                "browser_open", {"search": intent}
-            )
+            TaskStep(1, f"Search Google for {query}", "browser_open",
+                     {"search": query, "visible": True})
         ]
 
     def _plan_browser_extract(self, intent: str) -> List[TaskStep]:
