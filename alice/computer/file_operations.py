@@ -44,11 +44,13 @@ class FileOperations:
                 return False
 
         allowed_roots = []
-        for location in self.allowed_locations:
+        for location in list(self.allowed_locations) + [str(Path.cwd())]:
             try:
                 root = Path(os.path.expandvars(str(location))).expanduser()
                 if root.exists():
-                    allowed_roots.append(root.resolve())
+                    resolved_root = root.resolve()
+                    if resolved_root not in allowed_roots:
+                        allowed_roots.append(resolved_root)
             except (OSError, RuntimeError):
                 continue
 
