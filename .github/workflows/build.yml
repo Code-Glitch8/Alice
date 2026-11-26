@@ -50,9 +50,7 @@ jobs:
 
       - name: Upload to release
         if: github.event_name == 'release'
-        uses: actions/upload-release-asset@v4
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: dist/ALICE-Windows-Portable.zip
-          asset_name: ALICE-Windows-Portable.zip
-          asset_content_type: application/zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" "dist/ALICE-Windows-Portable.zip" --repo "${{ github.repository }}" --clobber
