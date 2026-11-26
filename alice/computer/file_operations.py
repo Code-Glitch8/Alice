@@ -13,7 +13,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
-from alice.core.access_manager import ComputerAccessManager
+from alice.core.access_manager import ComputerAccessManager, is_within
 
 logger = logging.getLogger(__name__)
 
