@@ -1040,6 +1040,7 @@ class TypeTextTool(Tool):
         text = kwargs.get("text", "")
         delay = max(0.0, float(kwargs.get("delay", 0) or 0))
         target_window = kwargs.get("target_window")
+        preserve_focus = bool(kwargs.get("preserve_focus", False))
         if not isinstance(text, str) or not text:
             return {"status": "error", "action": "type_text", "error": "Missing required parameter: text"}
 
@@ -1051,7 +1052,12 @@ class TypeTextTool(Tool):
 
             config = Config.load()
             engine = ComputerEngine(config)
-            if target_window:
+            if preserve_focus:
+                # A preceding planner step already focused the target and may
+                # have created a new document/tab. Do not refocus an older tab.
+                focused = True
+                focus_message = "Preserving the window focused by the preceding plan step"
+            elif target_window:
                 focused, focus_message = engine.focus_app(str(target_window))
             else:
                 focused = engine.auto_focus_most_relevant()
