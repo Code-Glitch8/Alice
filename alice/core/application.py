@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import inspect
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -33,8 +34,10 @@ class AliceApplication:
         # Central tool dispatcher - all tool execution goes through this
         self.tool_dispatcher = ToolDispatcher(self.tool_registry, config)
 
-        # Permission system
+        # Permission system. Frontends may supply an explicit Category B
+        # confirmation callback; without one, protected actions remain blocked.
         self.automation_config = config.automation
+        self.permission_confirmation_callback = None
         self.max_tool_calls = 5  # Prevent infinite loops
         self.current_tool_call_count = 0
 
@@ -266,14 +269,17 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 })
                 break
 
-            if not self._check_permission(tool):
+            if not await self._is_action_permitted(tool, step.description):
                 step.requires_confirmation = True
                 results.append({
                     "step": step.description, "tool": step.tool_name,
                     "status": "blocked",
                     "message": (
-                        f"Category {tool.required_permission} permission is not enabled. "
-                        "No action was taken for this step."
+                        (
+                            "Category B action was not approved. No action was taken for this step."
+                            if tool.required_permission == "B"
+                            else f"Category {tool.required_permission} permission is disabled. No action was taken for this step."
+                        )
                     )
                 })
                 break
@@ -754,7 +760,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
             tool = self.tool_registry.get(tool_name)
             if tool is None:
                 result = {"status": "error", "error": f"Tool '{tool_name}' not found"}
-            elif not self._check_permission(tool):
+            elif not await self._is_action_permitted(tool, f"Call {tool_name}"):
                 result = {
                     "status": "blocked",
                     "error": f"Permission denied for tool {tool_name} (category {tool.required_permission})."
@@ -769,6 +775,32 @@ Only call tools when the user explicitly requests a computer action. For normal 
             })
 
         return tool_results
+
+    async def _is_action_permitted(self, tool, description: str = "") -> bool:
+        """Check policy and, for Category B only, request explicit user approval.
+
+        Category A follows its configured auto-confirm policy. Category C stays
+        blocked whenever restricted. A frontend must provide a confirmation
+        callback to approve Category B; a missing callback never grants access.
+        """
+        if self._check_permission(tool):
+            return True
+
+        if tool.required_permission != "B":
+            return False
+
+        callback = self.permission_confirmation_callback
+        if not callable(callback):
+            return False
+
+        try:
+            result = callback(tool.name, description or tool.name)
+            if inspect.isawaitable(result):
+                result = await result
+            return result is True
+        except Exception:
+            logger.exception("Permission confirmation callback failed for %s", tool.name)
+            return False
 
     def _check_permission(self, tool) -> bool:
         """Check if tool execution is permitted based on automation config.
@@ -808,7 +840,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     "requires_confirmation": False
                 })
                 break
-            if not self._check_permission(tool):
+            if not await self._is_action_permitted(tool, step.description):
                 results.append({
                     "step_id": step.step_id, "description": step.description,
                     "tool": step.tool_name, "verified": False, "result": None,
