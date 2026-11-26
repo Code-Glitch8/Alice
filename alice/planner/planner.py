@@ -6,6 +6,7 @@ and executes them with verification.
 """
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -161,9 +162,65 @@ class TaskPlanner:
         if save_match:
             filename = save_match.group(1)
             from pathlib import Path
-            path = str(Path.home() / "Desktop" / filename) if "desktop" in intent.lower() else filename
+
+            # Use Windows known folder resolution for reliability
+            def get_known_folder_path(folder_name: str) -> Optional[Path]:
+                """Get Windows known folder path using Shell32 API."""
+                if os.name != "nt":
+                    return None
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    # Folder GUIDs
+                    folder_guids = {
+                        "Desktop": "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+                        "Documents": "{FDD39AD8-70D2-4664-B824-9D18820A6B39}",
+                        "Downloads": "{338E6FE1-3C68-4A47-B188-7540A5DD143}",
+                    }
+
+                    from uuid import UUID
+                    guid_str = folder_guids.get(folder_name)
+                    if not guid_str:
+                        return None
+
+                    guid = UUID(guid_str)
+                    guid_struct = wintypes.GUID(guid.int, guid.bytes_le[3], guid.bytes_le[2],
+                                                (guid.bytes_le[1], guid.bytes_le[0],
+                                                 guid.bytes_le[7], guid.bytes_le[6],
+                                                 guid.bytes_le[5], guid.bytes_le[4],
+                                                 guid.bytes_le[3], guid.bytes_le[2],
+                                                 guid.bytes_le[1], guid.bytes_le[0]))
+
+                    buffer = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+                    result = ctypes.windll.shell32.SHGetKnownFolderPath(guid_struct, 0, None, buffer)
+
+                    if result == 0:
+                        return Path(buffer.value)
+                except Exception:
+                    pass
+
+                # Fallback
+                user_profile = os.environ.get("USERPROFILE")
+                if user_profile:
+                    p = Path(user_profile) / folder_name
+                    if p.exists():
+                        return p
+                return Path.home() / folder_name
+
+            # Determine path based on intent
+            if "desktop" in intent.lower():
+                folder_path = get_known_folder_path("Desktop")
+            elif "documents" in intent.lower():
+                folder_path = get_known_folder_path("Documents")
+            elif "downloads" in intent.lower():
+                folder_path = get_known_folder_path("Downloads")
+            else:
+                folder_path = Path.home() / "Desktop"
+
+            path = str(folder_path / filename) if not Path(filename).is_absolute() else filename
             steps.append(TaskStep(
-                len(steps) + 1, f"Save as {filename}", "save_file",
+                len(steps) + 1, f"Save as {filename}", "write_file",
                 {"path": path, "content": text or "Hello from ALICE"}
             ))
 
@@ -179,13 +236,46 @@ class TaskPlanner:
         ]
 
     def _plan_create(self, intent: str) -> List[TaskStep]:
-        """Plan creating folders/files."""
-        return [
-            TaskStep(
-                1, "Create folder/file",
-                "create_folder", {"path": intent}
-            )
-        ]
+        """Plan creating folders and files."""
+        import re
+
+        # Check if this is a file being created (has extension)
+        # or a folder being created
+        path_match = re.search(r'(?:folder|file)\s+(?:called|c)?\s*["\']?([^\s"\'.,]+(?:\.[a-zA-Z0-9]+)?)["\']?', intent, re.IGNORECASE)
+        if path_match:
+            path = path_match.group(1)
+        else:
+            # Extract path from intent
+            path = intent.replace("create", "").replace("make", "").strip()
+
+        # Check if it's a file (has extension) or folder
+        if "." in path and not path.endswith(("/", os.sep)):
+            # It's a file
+            from pathlib import Path
+            file_path = Path(path)
+            parent = file_path.parent
+            steps = []
+
+            # Create parent directory if needed
+            if parent.name and str(parent) != ".":
+                steps.append(TaskStep(
+                    len(steps) + 1, f"Create folder {parent.name}", "create_folder",
+                    {"path": str(parent)}
+                ))
+
+            steps.append(TaskStep(
+                len(steps) + 1, f"Create file {file_path.name}", "write_file",
+                {"path": str(file_path), "content": ""}
+            ))
+            return steps
+        else:
+            # It's a folder
+            return [
+                TaskStep(
+                    1, "Create folder/file",
+                    "create_folder", {"path": intent}
+                )
+            ]
 
     def _plan_extract_zip(self, intent: str) -> List[TaskStep]:
         """Plan ZIP extraction."""

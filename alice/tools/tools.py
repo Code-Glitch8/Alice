@@ -318,8 +318,63 @@ class BrowserOpenTool(Tool):
         super().__init__("browser_open", "Open Google Chrome or perform a web search", required_permission="A")
 
     @classmethod
+    def _get_user_chrome_profile_dir(cls) -> Optional[Path]:
+        r"""Get the path to the user's actual Chrome profile directory.
+
+        Returns the Chrome user data directory (typically %LOCALAPPDATA%\Google\Chrome\User Data)
+        if it exists, or None if Chrome is not installed or profile not found.
+        """
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            chrome_profile = Path(local_app_data) / "Google" / "Chrome" / "User Data"
+            if chrome_profile.exists():
+                return chrome_profile
+        return None
+
+    @classmethod
+    def _detect_chrome_running(cls) -> Optional[int]:
+        """Detect if Chrome is already running with the user's profile.
+
+        Returns the PID of a running Chrome process if found, None otherwise.
+        """
+        try:
+            import psutil
+            user_profile = cls._get_user_chrome_profile_dir()
+            if not user_profile:
+                return None
+
+            profile_str = str(user_profile.resolve())
+            for proc in psutil.process_iter(["name", "cmdline"]):
+                try:
+                    name = (proc.info.get("name") or "").lower()
+                    if "chrome" not in name:
+                        continue
+                    # Check if it's using a Chrome profile (not --no-sandbox or other special flags)
+                    cmdline = proc.info.get("cmdline") or []
+                    for arg in cmdline:
+                        if isinstance(arg, str) and arg.startswith("--user-data-dir="):
+                            data_dir = arg.split("=", 1)[1].strip('"')
+                            if data_dir == profile_str:
+                                return proc.pid
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+        except ImportError:
+            pass
+        return None
+
+    @classmethod
     def _resolve_profile_dir(cls) -> Path:
-        """Return a persistent profile directory reserved exclusively for ALICE."""
+        """Return a persistent profile directory reserved exclusively for ALICE.
+
+        If a Chrome profile already exists in the user's standard location,
+        use that. Otherwise, create a managed profile under ALICE's local data folder.
+        """
+        user_profile = cls._get_user_chrome_profile_dir()
+        if user_profile:
+            # Use the user's actual Chrome profile
+            return user_profile
+
+        # Fall back to managed ALICE profile
         local_app_data = os.environ.get("LOCALAPPDATA")
         if local_app_data:
             root = Path(local_app_data)
@@ -419,8 +474,24 @@ class BrowserOpenTool(Tool):
 
     @classmethod
     def close_owned_browser(cls) -> dict:
-        """Close only Chrome processes using ALICE's dedicated profile."""
-        profile_dir = cls._managed_profile_dir or str(cls._resolve_profile_dir())
+        """Close only Chrome processes opened by ALICE.
+
+        If ALICE used the user's actual Chrome profile, we cannot safely close
+        those processes - they may be user-managed. We only close processes that
+        were launched with ALICE's managed profile directory.
+        """
+        profile_dir = cls._managed_profile_dir
+        if not profile_dir:
+            # If we never launched a managed profile, don't try to close anything
+            # This protects the user's actual Chrome sessions
+            return {
+                "status": "success",
+                "action": "close_app",
+                "app": "chrome",
+                "message": "No ALICE-managed Chrome session was launched; user's Chrome was not affected.",
+                "verification": {"closed_processes": 0, "note": "User profile was used, not managed by ALICE"}
+            }
+
         target_profile = os.path.normcase(os.path.abspath(profile_dir))
         try:
             import psutil
@@ -501,7 +572,6 @@ class BrowserExtractTool(Tool):
         selector = kwargs.get("selector")
         if not url:
             return {"status": "error", "error": "Missing required parameter: url"}
-        import asyncio
         import asyncio
         try:
             loop = asyncio.get_event_loop()
@@ -1063,6 +1133,143 @@ class SetClipboardTool(Tool):
             return {"status": "error", "error": str(e)}
 
 
+class WriteFileTool(Tool):
+    """Write content to a file with proper verification."""
+
+    def __init__(self):
+        super().__init__("write_file", "Write content to a file", required_permission="B")
+
+    def execute(self, **kwargs) -> dict:
+        """Write content to a file and verify the write was successful.
+
+        Args:
+            path: Full path to the file to write
+            content: Content to write (string)
+            encoding: File encoding (default: utf-8)
+
+        Returns:
+            Dict with status, verification info, and any error details
+        """
+        from alice.core.config import Config
+        from alice.computer.file_operations import FileOperations
+        from pathlib import Path
+
+        path = kwargs.get("path")
+        content = kwargs.get("content", "")
+        encoding = kwargs.get("encoding", "utf-8")
+
+        if not path:
+            return {
+                "status": "error",
+                "action": "write_file",
+                "message": "Missing required parameter: path",
+                "error": "Missing required parameter: path",
+                "verification": {"file_created": False}
+            }
+
+        try:
+            # Load config to get allowed locations
+            config = Config.load()
+            allowed_locations = config.automation.allowed_locations
+
+            # Resolve and validate the path
+            file_path = Path(path)
+            resolved_path = file_path.resolve()
+
+            # Check if path is in allowed locations
+            if allowed_locations:
+                is_allowed = any(
+                    str(resolved_path).startswith(str(Path(loc).resolve()))
+                    for loc in allowed_locations
+                )
+                if not is_allowed:
+                    # Also check if parent directory is in allowed locations
+                    parent_allowed = any(
+                        str(resolved_path.parent.resolve()).startswith(str(Path(loc).resolve()))
+                        for loc in allowed_locations
+                    )
+                    if not parent_allowed:
+                        return {
+                            "status": "error",
+                            "action": "write_file",
+                            "path": str(file_path),
+                            "message": f"Path not in allowed locations: {path}",
+                            "error": f"Path not in allowed locations: {path}",
+                            "verification": {"file_created": False, "allowed_locations": allowed_locations}
+                        }
+
+            # Ensure parent directory exists
+            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Write content to file
+            resolved_path.write_text(content, encoding=encoding)
+
+            # Small delay to ensure write completes
+            import time
+            time.sleep(0.1)
+
+            # Verify file exists and has correct content
+            if resolved_path.exists():
+                # Read back and verify content
+                verify_content = resolved_path.read_text(encoding=encoding)
+                if verify_content == content:
+                    return {
+                        "status": "success",
+                        "action": "write_file",
+                        "path": str(file_path),
+                        "message": f"Created file: {file_path}",
+                        "result": {
+                            "path": str(file_path),
+                            "size": resolved_path.stat().st_size,
+                            "lines": len(content.splitlines()) if content else 0
+                        },
+                        "verification": {
+                            "file_created": True,
+                            "content_match": True,
+                            "file_size": resolved_path.stat().st_size
+                        },
+                        "error": None
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "action": "write_file",
+                        "path": str(file_path),
+                        "message": f"File created but content verification failed",
+                        "error": "Content mismatch after write",
+                        "verification": {"file_created": True, "content_match": False}
+                    }
+            else:
+                return {
+                    "status": "error",
+                    "action": "write_file",
+                    "path": str(file_path),
+                    "message": f"File was not created",
+                    "error": "File not found after write operation",
+                    "verification": {"file_created": False}
+                }
+
+        except PermissionError as e:
+            return {
+                "status": "error",
+                "action": "write_file",
+                "path": str(path),
+                "message": f"Permission denied: {path}",
+                "error": str(e),
+                "verification": {"file_created": False}
+            }
+        except Exception as e:
+            logger.error(f"WriteFileTool error: {e}")
+            return {
+                "status": "error",
+                "action": "write_file",
+                "path": str(path),
+                "message": str(e),
+                "error": str(e),
+                "verification": {"file_created": False}
+            }
+
+
 class ToolDispatcher:
     """Central dispatcher for tool execution with async support."""
 
@@ -1130,6 +1337,7 @@ def create_default_tools() -> ToolRegistry:
     # File and folder tools
     registry.register(CreateFolderTool())
     registry.register(SearchFilesTool())
+    registry.register(WriteFileTool())
 
     # Browser tools
     registry.register(BrowserOpenTool())

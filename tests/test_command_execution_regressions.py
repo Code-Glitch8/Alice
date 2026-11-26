@@ -267,7 +267,7 @@ def test_close_chrome_with_no_alice_profile_does_not_touch_default_chrome(monkey
         result = CloseAppTool().execute(app_name="chrome")
 
     assert result["status"] == "success"
-    assert "other Chrome windows were left untouched" in result["message"]
+    assert "user's Chrome was not affected" in result["message"]
 
 
 

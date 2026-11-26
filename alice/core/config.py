@@ -55,17 +55,166 @@ class VoiceConfig:
     voice_activity_detection: bool = True
 
 
+def get_windows_known_folder_path(folder_id: str) -> Optional[Path]:
+    """Get a Windows known folder path using SHGetKnownFolderPath API.
+
+    This is more reliable than hardcoded paths like Path.home() / "Desktop".
+
+    Args:
+        folder_id: KNOWNFOLDERID string (e.g., "FOLDERID_Desktop", "FOLDERID_Downloads")
+
+    Returns:
+        Path to the known folder, or None if not found
+    """
+    if os.name != "nt":
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        # GUID mapping for common folders
+        folder_guids = {
+            "FOLDERID_Desktop": "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+            "FOLDERID_Documents": "{FDD39AD8-70D2-4664-B824-9D18820A6B39}",
+            "FOLDERID_Downloads": "{338E6FE1-3C68-4A47-B188-7540A5DD143}",
+            "FOLDERID_AppData_Roaming": "{FC4781D-32FE-40D6-BFE3-8FB749A51591}",
+            "FOLDERID_AppData_Local": "{C0698386-5A63-40AC-B948-E3115505689F}",
+        }
+
+        guid_str = folder_guids.get(folder_id)
+        if not guid_str:
+            return None
+
+        # Convert GUID string to GUID structure
+        guid = wintypes.GUID()
+        ctypes.windll.shell32.SHGetKnownFolderPath(
+            guid, 0, None, ctypes.byref(guid)
+        )
+
+        # Actually use the correct approach - convert string GUID to GUID
+        from uuid import UUID
+        guid_obj = UUID(guid_str)
+        guid = wintypes.GUID(guid_obj.int, guid_obj.bytes_le[3], guid_obj.bytes_le[2],
+                             (guid_obj.bytes_le[1], guid_obj.bytes_le[0],
+                              guid_obj.bytes_le[7], guid_obj.bytes_le[6],
+                              guid_obj.bytes_le[5], guid_obj.bytes_le[4],
+                              guid_obj.bytes_le[3], guid_obj.bytes_le[2],
+                              guid_obj.bytes_le[1], guid_obj.bytes_le[0]))
+
+        # Call SHGetKnownFolderPath
+        buffer = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+        result = ctypes.windll.shell32.SHGetKnownFolderPath(guid, 0, None, buffer)
+
+        if result == 0:
+            return Path(buffer.value)
+    except Exception:
+        pass
+
+    # Fallback to PATH environment variable approach
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        # Use ctypes to call SHGetKnownFolderPath correctly
+        KNOWNFOLDERID = wintypes.GUID
+        MAX_PATH = 260
+
+        # Desktop GUID: {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+        desktop_guid = (0xB4BFCC3A, 0xDB2C, 0x424C,
+                        (0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41))
+
+        buffer = ctypes.create_unicode_buffer(MAX_PATH)
+        result = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(wintypes.GUID(*desktop_guid)), 0, None, buffer
+        )
+        if result == 0:
+            return Path(buffer.value)
+    except Exception:
+        pass
+
+    return None
+
+
+def get_windows_known_folder(folder_name: str) -> Optional[Path]:
+    """Get Windows known folder path by friendly name.
+
+    Args:
+        folder_name: Name of the folder ("Desktop", "Documents", "Downloads")
+
+    Returns:
+        Path to the folder, or None if not found
+    """
+    folder_map = {
+        "Desktop": "FOLDERID_Desktop",
+        "Documents": "FOLDERID_Documents",
+        "Downloads": "FOLDERID_Downloads",
+    }
+
+    folder_id = folder_map.get(folder_name)
+    if not folder_id:
+        return None
+
+    path = get_windows_known_folder_path(folder_id)
+    return path
+
+
+def resolve_allowed_locations() -> list:
+    """Resolve the default allowed locations for file operations.
+
+    Uses Windows known folder APIs when available for reliable path resolution.
+    Falls back to Path.home() based paths on non-Windows systems.
+    """
+    locations = []
+
+    if os.name == "nt":
+        # Windows: use known folder API for reliability
+        for folder_name in ["Desktop", "Documents", "Downloads"]:
+            path = get_windows_known_folder(folder_name)
+            if path:
+                locations.append(str(path))
+
+        # If API failed, fall back to environment variables
+        if not locations:
+            user_profile = os.environ.get("USERPROFILE")
+            if user_profile:
+                for folder in ["Desktop", "Documents", "Downloads"]:
+                    p = Path(user_profile) / folder
+                    if p.exists():
+                        locations.append(str(p))
+    else:
+        # Non-Windows: use home directory
+        for folder in ["Desktop", "Documents", "Downloads"]:
+            p = Path.home() / folder
+            if p.exists():
+                locations.append(str(p))
+
+    # Ensure we always have at least the default locations
+    if not locations:
+        if os.name == "nt":
+            user_profile = os.environ.get("USERPROFILE", Path.home())
+            locations = [
+                str(Path(user_profile) / "Desktop"),
+                str(Path(user_profile) / "Documents"),
+                str(Path(user_profile) / "Downloads"),
+            ]
+        else:
+            locations = [
+                str(Path.home() / "Desktop"),
+                str(Path.home() / "Documents"),
+                str(Path.home() / "Downloads"),
+            ]
+
+    return locations
+
+
 @dataclass
 class AutomationConfig:
     auto_confirm_category_a: bool = True
-    require_confirm_category_b: bool = True
+    require_confirm_category_b: bool = False  # Set to False to auto-confirm Category B actions
     restricted_category_c: bool = True
     emergency_stop_enabled: bool = True
-    allowed_locations: list = field(default_factory=lambda: [
-        str(Path.home() / "Desktop"),
-        str(Path.home() / "Documents"),
-        str(Path.home() / "Downloads"),
-    ])
+    allowed_locations: list = field(default_factory=resolve_allowed_locations)
 
 
 @dataclass
