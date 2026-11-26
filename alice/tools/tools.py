@@ -443,10 +443,10 @@ class BrowserOpenTool(Tool):
 
             if not matches:
                 return {
-                    "status": "not_running",
+                    "status": "success",
                     "action": "close_app",
                     "app": "chrome",
-                    "message": "No ALICE-managed Chrome session is running. Other Chrome windows were left untouched.",
+                    "message": "No ALICE-managed Chrome session is running; other Chrome windows were left untouched.",
                     "verification": {"closed_processes": 0}
                 }
 
