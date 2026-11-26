@@ -274,57 +274,44 @@ class ComputerEngine:
         return None
 
     def _find_uwp_app(self, app_name: str) -> Optional[str]:
-        """Find UWP/MSIX packaged applications by name.
+        """Resolve a packaged Windows app to a launchable URI or executable.
 
-        MSIX apps can be launched via their AppUserModelID or through
-        Windows Package Manager (winget) or by using the 'explorer.exe' with
-        a special protocol.
+        Return a single string. The previous implementation sometimes returned
+        (command, type) here, which _resolve_app wrapped again and passed to
+        subprocess as a tuple, producing the reported path-like-object error.
         """
+        normalized = app_name.lower().strip()
+        packaged_aliases = {
+            "microsoft store": "ms-windows-store:",
+            "store": "ms-windows-store:",
+            "calculator": "calculator:",
+            "calc": "calculator:",
+        }
+        if normalized in packaged_aliases:
+            return packaged_aliases[normalized]
+
+        # Use the AppsFolder shell namespace for MSIX/UWP apps. Match the
+        # package's display name and return its AppUserModelID as a shell URI.
         try:
-            # Common UWP app name mappings
-            uwp_apps = {
-                "notepad": "notepad.exe",  # Notepad is also available as traditional exe
-                "microsoft store": "Microsoft.WindowsStore_8wekyb3d8bbwe",
-                "store": "Microsoft.WindowsStore_8wekyb3d8bbwe",
-                "calculator": "Microsoft.WindowsCalculator_8wekyb3d8bbwe",
-                "xbox": "Microsoft.XboxApp_8wekyb3d8bbwe",
-                "get help": "Microsoft.GetHelp_8wekyb3d8bbwe",
-            }
-
-            # Check for package-based launch commands (protocols)
-            for key, package_id in uwp_apps.items():
-                if key in app_name.lower():
-                    # Check if it's a simple exe path (like notepad)
-                    if package_id.endswith(".exe"):
-                        return package_id, "exe"
-                    # Return a protocol launch command for packaged apps
-                    # These will be handled by the shell
-                    if "store" in key:
-                        return "ms-windows-store:", "protocol"
-                    elif "calculator" in key:
-                        return "ms-windows-cal:", "protocol"
-                    # For other UWP apps, let the shell resolve them
-
-            # Check if we can find a packaged app launch command
-            # Use Windows PowerShell to find installed packages
-            try:
-                result = subprocess.run(
-                    ["powershell", "-Command", f"Get-AppxPackage -Name *{app_name}* | Select-Object -ExpandProperty InstallLocation"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    package_dir = result.stdout.strip().split('\n')[0]
-                    if package_dir:
-                        # Look for the main executable
-                        for item in Path(package_dir).rglob("*.exe"):
-                            return str(item), "exe"
-            except Exception:
-                pass
-        except Exception:
-            pass
-        return None, None
+            command = (
+                "$ErrorActionPreference='Stop'; "
+                "$apps=Get-StartApps; "
+                "$match=$apps | Where-Object { $_.Name -like '*"
+                + normalized.replace("'", "''")
+                + "*' } | Select-Object -First 1; "
+                "if ($match) { $match.AppID }"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True, text=True, timeout=12,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            app_id = (result.stdout or "").strip()
+            if result.returncode == 0 and app_id:
+                return "shell:AppsFolder\\" + app_id
+        except Exception as exc:
+            logger.debug("Packaged app discovery failed for %s: %s", app_name, exc)
+        return None
 
     def open_app(self, app_name: str, target_path: Optional[str] = None) -> Tuple[bool, str, Dict[str, Any]]:
         """Open an application by name. Returns (success, message, details).
