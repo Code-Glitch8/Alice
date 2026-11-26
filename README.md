@@ -104,7 +104,7 @@ Example:
 Open the ALICE dashboard Settings tab to configure computer access. The requested defaults enable all of these permissions:
 
 - Search all mounted drives (Windows drive letters discovered at runtime).
-- Read accessible UTF-8 text files (2 MiB per-file limit).
+- Read accessible UTF-8 text files (32 KiB per-file limit).
 - Create files and folders.
 - Edit existing files.
 - Move and organize files and folders.
@@ -130,7 +130,7 @@ New file tools: `read_file(path)` and `move_file(src, dst)`. File reads are text
 **File Operations (Category A):**
 - `create_folder` - Create directories
 - `search_files` - Search for files by name/extension across enabled drives
-- `read_file` - Read a UTF-8 text file (2 MiB limit)
+- `read_file` - Read a UTF-8 text file (32 KiB limit)
 - `move_file` - Move or organize files/folders (explicit approval required)
 
 **Browser Automation (Category A/B):**
