@@ -497,8 +497,8 @@ class MoveFileTool(Tool):
                 allowed, reason = access.validate_path(candidate)
                 if not allowed:
                     return {"status": "blocked", "action": "move_file", "error": reason}
-            if access.protected_destructive_path(src):
-                return {"status": "blocked", "action": "move_file", "error": "Refusing to move a protected Windows system location."}
+            if access.protected_destructive_path(src) or access.protected_destructive_path(dst):
+                return {"status": "blocked", "action": "move_file", "error": "Refusing to move from or into a protected Windows system location."}
             ok, message, details = FileOperations(config).move_file(src, dst)
             return {"status": "success" if ok else "error", "action": "move_file",
                     "message": message, "result": details if ok else None,
