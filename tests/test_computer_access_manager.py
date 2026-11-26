@@ -136,3 +136,22 @@ def test_overwrite_requires_confirmation_but_new_file_does_not(tmp_path):
     calls.clear()
     assert asyncio.run(app._is_action_permitted(tool, "Create file", {"path": str(tmp_path / "new.txt"), "content": "new"}))
     assert calls == []
+
+
+def test_planner_creates_move_step_for_explicit_paths(tmp_path):
+    planner = __import__("alice.planner.planner", fromlist=["TaskPlanner"]).TaskPlanner(tool_registry=None)
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "archive"
+    steps = planner.plan(f"move file {source} to {destination}")
+    assert len(steps) == 1
+    assert steps[0].tool_name == "move_file"
+    assert steps[0].parameters["src"] == str(source)
+    assert steps[0].parameters["dst"] == str(destination)
+
+
+def test_planner_creates_delete_step_for_explicit_file():
+    from alice.planner.planner import TaskPlanner
+    steps = TaskPlanner(tool_registry=None).plan("delete file old-notes.txt")
+    assert len(steps) == 1
+    assert steps[0].tool_name == "delete_file"
+    assert steps[0].parameters["path"].endswith("old-notes.txt")
