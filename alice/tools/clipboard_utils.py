@@ -75,8 +75,10 @@ def set_text_to_clipboard(text: str, target_window: Optional[str] = None) -> Dic
         pyperclip.copy("")
         time.sleep(0.1)
 
-        # Set the actual text
+        # Set the actual text. Mark it modified immediately so the finally
+        # block restores even when sending Ctrl+V raises an exception.
         pyperclip.copy(text)
+        clipboard_was_modified = True
         time.sleep(0.1)  # Small delay to ensure clipboard is updated
 
         # Focus target window if specified
@@ -94,8 +96,6 @@ def set_text_to_clipboard(text: str, target_window: Optional[str] = None) -> Dic
         pyautogui.hotkey('ctrl', 'v')
         time.sleep(0.2)  # Give time for paste to complete
 
-        clipboard_was_modified = True
-
         return {
             "status": "success",
             "action": "clipboard_paste",
@@ -104,7 +104,7 @@ def set_text_to_clipboard(text: str, target_window: Optional[str] = None) -> Dic
             "verification": {
                 "success": True,
                 "method": "clipboard_paste",
-                "original_clipboard_restored": True
+                "paste_shortcut_sent": True
             },
             "_original_content": original_content  # For later restoration
         }
@@ -113,7 +113,7 @@ def set_text_to_clipboard(text: str, target_window: Optional[str] = None) -> Dic
         return {"status": "error", "error": str(e), "clipboard_restored": False}
     finally:
         # Restore original clipboard content
-        if clipboard_was_modified and original_content:
+        if clipboard_was_modified:
             try:
                 restore_clipboard_content(original_content)
             except Exception as e:
