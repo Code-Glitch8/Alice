@@ -553,134 +553,122 @@ class ComputerEngine:
             return False
 
     def list_installed_apps(self) -> List[Dict[str, Any]]:
-        """Discover and list installed applications on the system.
-
-        Uses multiple discovery methods:
-        1. Windows registry App Paths and Uninstall entries
-        2. Start Menu shortcuts
-        3. PATH environment variable
-
-        Returns:
-            List of installed applications with name, path, and type
-        """
-        apps = []
+        """Discover installed desktop and packaged applications on Windows."""
+        apps: List[Dict[str, Any]] = []
         seen_names = set()
 
-        # Method 1: Check registry for installed applications
+        def add(name: str, path: str = "", app_type: str = "installed", **extra) -> None:
+            clean_name = (name or "").strip()
+            key = clean_name.casefold()
+            if not clean_name or key in seen_names:
+                return
+            seen_names.add(key)
+            apps.append({"name": clean_name, "path": path or "", "type": app_type, **extra})
+
+        # Uninstall registry entries are the most complete source for classic
+        # desktop applications. DisplayName must not depend on InstallLocation.
         try:
             import winreg
-
-            # Check App Paths
-            reg_paths = [
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"),
+            uninstall_paths = [
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
                 (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
             ]
-
-            for root, reg_path in reg_paths:
-                try:
-                    with winreg.OpenKey(root, reg_path) as key:
-                        i = 0
-                        while True:
-                            try:
-                                subkey_name = winreg.EnumKey(key, i)
-                                with winreg.OpenKey(key, subkey_name) as subkey:
-                                    # Try to get display name
+            views = [getattr(winreg, "KEY_WOW64_64KEY", 0), getattr(winreg, "KEY_WOW64_32KEY", 0)]
+            for root, registry_path in uninstall_paths:
+                for view in views:
+                    try:
+                        with winreg.OpenKey(root, registry_path, 0, winreg.KEY_READ | view) as key:
+                            index = 0
+                            while True:
+                                try:
+                                    subkey_name = winreg.EnumKey(key, index)
+                                    index += 1
                                     try:
-                                        display_name, _ = winreg.QueryValueEx(subkey, "DisplayName")
-                                        install_location, _ = winreg.QueryValueEx(subkey, "InstallLocation")
-                                        install_string, _ = winreg.QueryValueEx(subkey, "InstallLocation")
-                                    except (FileNotFoundError, OSError):
-                                        display_name = subkey_name
-                                        install_location = ""
-                                        install_string = ""
+                                        with winreg.OpenKey(key, subkey_name) as subkey:
+                                            def read_value(value_name: str, default: str = "") -> str:
+                                                try:
+                                                    value, _ = winreg.QueryValueEx(subkey, value_name)
+                                                    return str(value or "")
+                                                except OSError:
+                                                    return default
 
-                                    # Try to get executable path
-                                    try:
-                                        exe_path, _ = winreg.QueryValueEx(subkey, "")
-                                        if exe_path and Path(exe_path).exists():
-                                            app_key = display_name.lower().strip() if display_name else subkey_name.lower()
-                                            if app_key not in seen_names:
-                                                seen_names.add(app_key)
-                                                apps.append({
-                                                    "name": display_name or subkey_name,
-                                                    "path": exe_path,
-                                                    "type": "registry",
-                                                    "install_location": install_location
-                                                })
-                                    except (FileNotFoundError, OSError):
-                                        pass
+                                            display_name = read_value("DisplayName", subkey_name)
+                                            if read_value("SystemComponent", "0") == "1":
+                                                continue
+                                            add(
+                                                display_name,
+                                                read_value("InstallLocation") or read_value("DisplayIcon"),
+                                                "registry",
+                                                publisher=read_value("Publisher"),
+                                                version=read_value("DisplayVersion"),
+                                                uninstall_string=read_value("UninstallString"),
+                                            )
+                                    except OSError:
+                                        continue
+                                except OSError:
+                                    break
+                    except OSError:
+                        continue
+        except Exception as exc:
+            logger.debug("Installed-app registry discovery failed: %s", exc)
 
-                                i += 1
-                            except OSError:
-                                break
-                except OSError:
-                    continue
-        except Exception as e:
-            logger.debug(f"Registry discovery error: {e}")
-
-        # Method 2: Check Start Menu shortcuts
+        # Start Menu shortcuts include apps without ordinary uninstall entries.
         try:
-            start_menu_paths = self._get_start_menu_paths()
-            for menu_path in start_menu_paths:
+            for menu_path in self._get_start_menu_paths():
                 if not menu_path.exists():
                     continue
                 for root, dirs, files in os.walk(menu_path):
                     for filename in files:
-                        if filename.lower().endswith('.lnk'):
-                            filepath = Path(root) / filename
-                            app_name = filename.replace('.lnk', '').strip()
-                            if app_name not in seen_names:
-                                try:
-                                    import pythoncom
-                                    from win32com.shell import shell
-                                    shortcut = shell.CreateShortCut(str(filepath))
-                                    if shortcut and shortcut.Targetpath:
-                                        seen_names.add(app_name.lower())
-                                        apps.append({
-                                            "name": app_name,
-                                            "path": shortcut.Targetpath,
-                                            "type": "start_menu",
-                                            "shortcut": str(filepath)
-                                        })
-                                except Exception:
-                                    pass
-        except Exception as e:
-            logger.debug(f"Start Menu discovery error: {e}")
+                        if not filename.lower().endswith(".lnk"):
+                            continue
+                        shortcut_path = Path(root) / filename
+                        try:
+                            import pythoncom
+                            from win32com.shell import shell
+                            shortcut = shell.CreateShortCut(str(shortcut_path))
+                            if shortcut and shortcut.Targetpath:
+                                add(Path(filename).stem, shortcut.Targetpath, "start_menu", shortcut=str(shortcut_path))
+                        except Exception:
+                            continue
+        except Exception as exc:
+            logger.debug("Start Menu app discovery failed: %s", exc)
 
-        # Method 3: Add known aliases
-        for alias, exe in self.APP_ALIASES.items():
-            alias_lower = alias.lower()
-            if alias_lower not in seen_names:
-                seen_names.add(alias_lower)
-                apps.append({
-                    "name": alias,
-                    "path": exe,
-                    "type": "alias"
-                })
-
-        # Method 4: Check PATH for executables
+        # Get-StartApps finds packaged apps that have no ordinary executable.
         try:
-            path_dirs = os.environ.get("PATH", "").split(";")
-            for path_dir in path_dirs[:50]:  # Limit to prevent performance issues
-                path_dir = Path(path_dir)
-                if not path_dir.exists() or not path_dir.is_dir():
-                    continue
-                for exe_file in list(path_dir.glob("*.exe"))[:10]:  # Limit per directory
-                    app_name = exe_file.stem
-                    if app_name.lower() not in seen_names:
-                        seen_names.add(app_name.lower())
-                        apps.append({
-                            "name": app_name,
-                            "path": str(exe_file),
-                            "type": "path"
-                        })
-        except Exception:
-            pass
+            command = 'Get-StartApps | ForEach-Object { "$($_.Name)" + [char]9 + "$($_.AppID)" }'
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0:
+                for line in (result.stdout or "").splitlines():
+                    name, separator, app_id = line.partition("\t")
+                    if separator and name.strip() and app_id.strip():
+                        add(name, "shell:AppsFolder\\" + app_id.strip(), "packaged")
+        except Exception as exc:
+            logger.debug("Packaged app discovery failed: %s", exc)
 
-        return apps
+        # Add aliases last so real installed-app records take precedence.
+        for alias, command in self.APP_ALIASES.items():
+            add(alias, command, "alias")
+
+        # PATH executables supplement registry and Start Menu discovery.
+        try:
+            for path_dir in os.environ.get("PATH", "").split(os.pathsep)[:50]:
+                directory = Path(path_dir.strip('"'))
+                if not directory.is_dir():
+                    continue
+                try:
+                    for executable in directory.glob("*.exe"):
+                        add(executable.stem, str(executable), "path")
+                except OSError:
+                    continue
+        except Exception as exc:
+            logger.debug("PATH app discovery failed: %s", exc)
+
+        return sorted(apps, key=lambda item: item["name"].casefold())
 
     def find_app(self, app_name: str) -> Optional[Dict[str, Any]]:
         """Find an installed application by name.
