@@ -897,6 +897,15 @@ Only call tools when the user explicitly requests a computer action. For normal 
             if not callable(callback):
                 return False
             details = dict(arguments)
+            if tool.name == "move_file":
+                try:
+                    from pathlib import Path
+                    destination = Path(str(arguments.get("dst") or arguments.get("destination"))).expanduser()
+                    source = Path(str(arguments.get("src") or arguments.get("source"))).expanduser()
+                    if destination.is_dir():
+                        details["resolved_destination"] = str(destination / source.name)
+                except (OSError, TypeError, ValueError):
+                    pass
             if tool.name == "delete_folder" and target:
                 try:
                     from pathlib import Path
