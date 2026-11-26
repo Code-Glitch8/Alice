@@ -234,16 +234,33 @@ class CreateFolderTool(Tool):
             from alice.core.config import Config
             config = Config.load()
             engine = ComputerEngine(config)
-            success, message = engine.create_folder(path)
+
+            # Resolve the path to handle OneDrive redirects and relative paths
+            from pathlib import Path
+            resolved_path = Path(path).resolve()
+
+            success, message = engine.create_folder(str(resolved_path))
+
+            # Verify the folder exists after creation
+            folder_actually_exists = resolved_path.exists() and resolved_path.is_dir()
+            verification_result = {
+                "folder_exists": folder_actually_exists,
+                "resolved_path": str(resolved_path) if success else None
+            }
+
+            # Override success if folder doesn't actually exist
+            if success and not folder_actually_exists:
+                message = f"Folder creation reported success but folder not found at {resolved_path}"
+                success = False
+
             return {
                 "status": "success" if success else "error",
                 "action": "create_folder",
-                "path": path,
+                "path": str(resolved_path),
+                "original_path": path,
                 "message": message,
-                "result": {"path": path} if success else None,
-                "verification": {
-                    "folder_exists": Path(path).exists() if success else False
-                },
+                "result": {"path": str(resolved_path)} if success else None,
+                "verification": verification_result,
                 "error": None if success else message
             }
         except Exception as e:
@@ -333,29 +350,18 @@ class BrowserOpenTool(Tool):
 
     @classmethod
     def _detect_chrome_running(cls) -> Optional[int]:
-        """Detect if Chrome is already running with the user's profile.
+        """Detect if Chrome is already running.
 
         Returns the PID of a running Chrome process if found, None otherwise.
+        Checks for any Chrome process, not just one with a specific profile.
         """
         try:
             import psutil
-            user_profile = cls._get_user_chrome_profile_dir()
-            if not user_profile:
-                return None
-
-            profile_str = str(user_profile.resolve())
             for proc in psutil.process_iter(["name", "cmdline"]):
                 try:
                     name = (proc.info.get("name") or "").lower()
-                    if "chrome" not in name:
-                        continue
-                    # Check if it's using a Chrome profile (not --no-sandbox or other special flags)
-                    cmdline = proc.info.get("cmdline") or []
-                    for arg in cmdline:
-                        if isinstance(arg, str) and arg.startswith("--user-data-dir="):
-                            data_dir = arg.split("=", 1)[1].strip('"')
-                            if data_dir == profile_str:
-                                return proc.pid
+                    if "chrome" in name:
+                        return proc.pid
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
         except ImportError:
@@ -399,6 +405,70 @@ class BrowserOpenTool(Tool):
                 return str(candidate)
         return shutil.which("chrome.exe") or shutil.which("chrome")
 
+    def _resolve_url(self, url: str) -> str:
+        """Resolve a URL string to a full http/https URL.
+
+        Handles bare domain names (e.g., "youtube.com") by prepending https://.
+        Common website names are resolved to their canonical URLs.
+
+        Args:
+            url: The URL or domain to resolve
+
+        Returns:
+            A full URL string
+        """
+        from urllib.parse import urlparse
+
+        # Dictionary of common website aliases
+        website_aliases = {
+            "youtube": "https://www.youtube.com",
+            "yt": "https://www.youtube.com",
+            "google": "https://www.google.com",
+            "g": "https://www.google.com",
+            "github": "https://www.github.com",
+            "git": "https://www.github.com",
+            "stackoverflow": "https://stackoverflow.com",
+            "docs": "https://developer.mozilla.org",
+            "mdn": "https://developer.mozilla.org",
+            "reddit": "https://www.reddit.com",
+            "news": "https://news.ycombinator.com",
+            "hn": "https://news.ycombinator.com",
+            "twitter": "https://twitter.com",
+            "x": "https://twitter.com",
+            "facebook": "https://www.facebook.com",
+            "fb": "https://www.facebook.com",
+            "instagram": "https://www.instagram.com",
+            "linkedin": "https://www.linkedin.com",
+            "twitter": "https://twitter.com",
+            "x.com": "https://twitter.com",
+            "chatgpt": "https://chat.openai.com",
+            "openai": "https://openai.com",
+            "lmstudio": "https://lmstudio.ai",
+            "claude": "https://claude.ai",
+        }
+
+        url_lower = url.lower().strip()
+
+        # Check website aliases first
+        if url_lower in website_aliases:
+            return website_aliases[url_lower]
+
+        # Check if it's already a valid URL
+        parsed = urlparse(url)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return url
+
+        # If no scheme, try to add https://
+        if not parsed.scheme and not parsed.netloc:
+            # Check if it looks like a domain
+            if any(c.isalpha() for c in url_lower) and "." in url_lower:
+                return f"https://{url}"
+            # If it looks like a search query
+            if " " in url:
+                return f"https://www.google.com/search?q={url}"
+
+        return url
+
     def _launch_chrome(self, url: Optional[str] = None, search: Optional[str] = None) -> dict:
         """Open Chrome with ALICE's separate, persistent regular browser profile."""
         from urllib.parse import urlencode, urlparse
@@ -409,10 +479,10 @@ class BrowserOpenTool(Tool):
                 return {"status": "error", "action": "browser_open", "error": "Search query is empty."}
             target_url = "https://www.google.com/search?" + urlencode({"q": query})
         elif url:
-            target_url = str(url).strip()
+            target_url = self._resolve_url(str(url).strip())
             parsed = urlparse(target_url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                return {"status": "error", "action": "browser_open", "error": "URL must use http:// or https://."}
+                return {"status": "error", "action": "browser_open", "error": f"Invalid URL: {url}. URL must use http:// or https:// or be a known website."}
         else:
             return {"status": "error", "action": "browser_open", "error": "Provide a URL or search query."}
 

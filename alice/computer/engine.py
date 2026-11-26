@@ -75,11 +75,19 @@ class ComputerEngine:
         return fo.search_files(query, folder)
 
     def create_folder(self, path: str) -> Tuple[bool, str]:
-        """Create a folder at the specified path. Returns (success, message)."""
+        """Create a folder at the specified path. Returns (success, message).
+
+        Verifies that the folder actually exists after creation.
+        """
         try:
-            folder = Path(path)
+            folder = Path(path).resolve()
             folder.mkdir(parents=True, exist_ok=True)
-            return True, f"Created folder: {path}"
+
+            # Verify the folder exists
+            if folder.exists() and folder.is_dir():
+                return True, f"Created folder: {path}"
+            else:
+                return False, f"Folder creation failed - folder not found at {path}"
         except Exception as e:
             logger.error(f"Failed to create folder {path}: {e}")
             return False, str(e)
@@ -121,6 +129,13 @@ class ComputerEngine:
     def _resolve_app(self, app_name: str, target_path: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
         """Resolve an application name to an executable command and its type.
 
+        Uses multiple discovery methods:
+        1. Known aliases (hardcoded common apps)
+        2. PATH environment variable
+        3. Windows registry App Paths
+        4. Start Menu shortcuts (roaming and all-users)
+        5. UWP/MSIX packaged applications
+
         Returns (command, type) where type is 'exe', 'protocol', 'msc', or 'explorer'.
         For File Explorer, can optionally specify a target path.
         """
@@ -141,7 +156,7 @@ class ComputerEngine:
             return cmd, "exe"
 
         # Handle File Explorer variations
-        if "explorer" in app_lower or "file" in app_lower and "explorer" in app_lower:
+        if "explorer" in app_lower or ("file" in app_lower and "explorer" in app_lower):
             if target_path:
                 return f'explorer.exe "{target_path}"', "explorer"
             return "explorer.exe", "explorer"
@@ -187,6 +202,128 @@ class ComputerEngine:
         except Exception:
             pass
 
+        # Discover from Start Menu shortcuts (roaming and local)
+        try:
+            start_menu_paths = self._get_start_menu_paths()
+            for menu_path in start_menu_paths:
+                exe_path = self._find_app_in_start_menu(menu_path, app_lower)
+                if exe_path:
+                    return exe_path, "exe"
+        except Exception:
+            pass
+
+        # Try to find UWP/MSIX packaged applications
+        try:
+            uwp_exe = self._find_uwp_app(app_lower)
+            if uwp_exe:
+                return uwp_exe, "exe"
+        except Exception:
+            pass
+
+        return None, None
+
+    def _get_start_menu_paths(self) -> List[Path]:
+        """Get common Start Menu shortcut locations on Windows."""
+        paths = []
+        try:
+            # User's Start Menu
+            appdata = os.environ.get("APPDATA")
+            if appdata:
+                user_start = Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+                if user_start.exists():
+                    paths.append(user_start)
+
+            # All Users Start Menu
+            program_data = os.environ.get("PROGRAMDATA") or "C:\\ProgramData"
+            all_users_start = Path(program_data) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+            if all_users_start.exists():
+                paths.append(all_users_start)
+
+            # Check for Start Menu folder variants
+            start_menu = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
+            if start_menu.exists():
+                paths.append(start_menu / "Programs")
+        except Exception:
+            pass
+        return paths
+
+    def _find_app_in_start_menu(self, menu_path: Path, app_name: str) -> Optional[str]:
+        """Search for an application shortcut in a Start Menu folder."""
+        try:
+            # Search through all subdirectories for .lnk or .exe shortcuts
+            for root, dirs, files in os.walk(menu_path):
+                for filename in files:
+                    filepath = Path(root) / filename
+                    if filename.lower().endswith('.lnk'):
+                        # Check if the shortcut filename contains our app name
+                        if app_name in filename.replace('.lnk', '').lower():
+                            # Get the target of the shortcut via COM
+                            try:
+                                import pythoncom
+                                from win32com.shell import shell
+                                shortcut = shell.CreateShortCut(str(filepath))
+                                if shortcut and Path(shortcut.Targetpath).exists():
+                                    return shortcut.Targetpath
+                            except Exception:
+                                pass
+                    elif filename.lower().endswith('.exe') and app_name in filename.lower():
+                        if filepath.exists():
+                            return str(filepath)
+        except Exception:
+            pass
+        return None
+
+    def _find_uwp_app(self, app_name: str) -> Optional[str]:
+        """Find UWP/MSIX packaged applications by name.
+
+        MSIX apps can be launched via their AppUserModelID or through
+        Windows Package Manager (winget) or by using the 'explorer.exe' with
+        a special protocol.
+        """
+        try:
+            # Common UWP app name mappings
+            uwp_apps = {
+                "notepad": "notepad.exe",  # Notepad is also available as traditional exe
+                "microsoft store": "Microsoft.WindowsStore_8wekyb3d8bbwe",
+                "store": "Microsoft.WindowsStore_8wekyb3d8bbwe",
+                "calculator": "Microsoft.WindowsCalculator_8wekyb3d8bbwe",
+                "xbox": "Microsoft.XboxApp_8wekyb3d8bbwe",
+                "get help": "Microsoft.GetHelp_8wekyb3d8bbwe",
+            }
+
+            # Check for package-based launch commands (protocols)
+            for key, package_id in uwp_apps.items():
+                if key in app_name.lower():
+                    # Check if it's a simple exe path (like notepad)
+                    if package_id.endswith(".exe"):
+                        return package_id, "exe"
+                    # Return a protocol launch command for packaged apps
+                    # These will be handled by the shell
+                    if "store" in key:
+                        return "ms-windows-store:", "protocol"
+                    elif "calculator" in key:
+                        return "ms-windows-cal:", "protocol"
+                    # For other UWP apps, let the shell resolve them
+
+            # Check if we can find a packaged app launch command
+            # Use Windows PowerShell to find installed packages
+            try:
+                result = subprocess.run(
+                    ["powershell", "-Command", f"Get-AppxPackage -Name *{app_name}* | Select-Object -ExpandProperty InstallLocation"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    package_dir = result.stdout.strip().split('\n')[0]
+                    if package_dir:
+                        # Look for the main executable
+                        for item in Path(package_dir).rglob("*.exe"):
+                            return str(item), "exe"
+            except Exception:
+                pass
+        except Exception:
+            pass
         return None, None
 
     def open_app(self, app_name: str, target_path: Optional[str] = None) -> Tuple[bool, str, Dict[str, Any]]:

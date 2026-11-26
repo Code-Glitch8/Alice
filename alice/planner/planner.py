@@ -238,42 +238,131 @@ class TaskPlanner:
     def _plan_create(self, intent: str) -> List[TaskStep]:
         """Plan creating folders and files."""
         import re
+        import os
 
-        # Check if this is a file being created (has extension)
-        # or a folder being created
-        path_match = re.search(r'(?:folder|file)\s+(?:called|c)?\s*["\']?([^\s"\'.,]+(?:\.[a-zA-Z0-9]+)?)["\']?', intent, re.IGNORECASE)
-        if path_match:
-            path = path_match.group(1)
+        # Extract folder/file name from intent
+        # Priority 1: Pattern "create folder/file called X" or "create folder called X anywhere"
+        # This handles "Create a folder called Physics Notes on my Desktop"
+        name_match = re.search(
+            r'(?:folder|file)\s+(?:called\s+|\'c\s+|\'c[,.]?\s+|\'?\s+)?["\']?((?:[^"\'.,\s]+\s*){1,5})["\']?',
+            intent, re.IGNORECASE
+        )
+
+        if name_match:
+            name = name_match.group(1).strip().strip('"\'').strip()
+            # Remove trailing location words that might have been captured
+            for stop_word in ['on my', 'on', 'in my', 'in', 'on the', 'desktop', 'documents', 'downloads']:
+                if name.lower().endswith(stop_word):
+                    name = name[:-len(stop_word)].strip()
         else:
-            # Extract path from intent
-            path = intent.replace("create", "").replace("make", "").strip()
+            # Try pattern: "create [something] folder" or "make [something] folder"
+            alt_match = re.search(r'(?:create|make)\s+([^\s"\']+?)\s+(?:folder|file|directory)', intent, re.IGNORECASE)
+            if alt_match:
+                name = alt_match.group(1)
+            else:
+                # Try pattern: "create folder [name]" - more direct pattern
+                direct_match = re.search(r'(?:create|make)\s+(?:folder|file)\s+(?:called\s+|\'c\s+|\'c[,.]?\s+|\'?\s*)["\']?((?:[^"\'.,\s]+\s*){1,5})["\']?', intent, re.IGNORECASE)
+                if direct_match:
+                    name = direct_match.group(1).strip().strip('"\'').strip()
+                    # Remove trailing location words
+                    for stop_word in ['on my', 'on', 'in my', 'in', 'on the', 'desktop', 'documents', 'downloads']:
+                        if name.lower().endswith(stop_word):
+                            name = name[:-len(stop_word)].strip()
+                else:
+                    # Try pattern: "create X on my Desktop" or "create X in Documents"
+                    context_match = re.search(r'(?:create|make)\s+(.+?)\s+(?:on\s+my\s+)?(?:desktop|documents|downloads)', intent, re.IGNORECASE)
+                    if context_match:
+                        name = context_match.group(1).strip()
+                    else:
+                        # Last resort: extract path from intent directly (for backward compatibility)
+                        name = intent.replace("create", "").replace("make", "").strip()
 
         # Check if it's a file (has extension) or folder
-        if "." in path and not path.endswith(("/", os.sep)):
+        if "." in name and not name.endswith(("/", os.sep)):
             # It's a file
             from pathlib import Path
-            file_path = Path(path)
+            file_path = Path(name)
             parent = file_path.parent
+
+            # Check for folder context (e.g., "on my Desktop", "in Documents")
+            folder_context = None
+            desktop_match = re.search(r'(?:desktop|on\s+my\s+desktop)', intent, re.IGNORECASE)
+            docs_match = re.search(r'(?:documents|doc|my\s+documents)', intent, re.IGNORECASE)
+            downloads_match = re.search(r'(?:downloads|my\s+downloads)', intent, re.IGNORECASE)
+
+            if desktop_match:
+                from alice.core.config import get_windows_known_folder
+                folder_context = get_windows_known_folder("Desktop")
+            elif docs_match:
+                from alice.core.config import get_windows_known_folder
+                folder_context = get_windows_known_folder("Documents")
+            elif downloads_match:
+                from alice.core.config import get_windows_known_folder
+                folder_context = get_windows_known_folder("Downloads")
+
             steps = []
 
+            # Determine parent directory
+            if file_path.is_absolute():
+                target_path = file_path
+            else:
+                if folder_context:
+                    target_path = folder_context / file_path.name
+                elif parent.name and str(parent) != ".":
+                    # Use the extracted parent from the name
+                    target_path = file_path
+                else:
+                    # Default to Desktop
+                    from alice.core.config import get_windows_known_folder
+                    desktop = get_windows_known_folder("Desktop")
+                    target_path = desktop / file_path.name if desktop else Path.home() / "Desktop" / file_path.name
+
             # Create parent directory if needed
-            if parent.name and str(parent) != ".":
+            actual_parent = target_path.parent
+            if actual_parent.name and str(actual_parent) != ".":
                 steps.append(TaskStep(
-                    len(steps) + 1, f"Create folder {parent.name}", "create_folder",
-                    {"path": str(parent)}
+                    len(steps) + 1, f"Create folder {actual_parent.name}", "create_folder",
+                    {"path": str(actual_parent)}
                 ))
 
             steps.append(TaskStep(
-                len(steps) + 1, f"Create file {file_path.name}", "write_file",
-                {"path": str(file_path), "content": ""}
+                len(steps) + 1, f"Create file {target_path.name}", "write_file",
+                {"path": str(target_path), "content": ""}
             ))
             return steps
         else:
-            # It's a folder
+            # It's a folder - determine the full path
+            from pathlib import Path
+            from alice.core.config import get_windows_known_folder
+            folder_name = Path(name).name if name else "NewFolder"
+
+            # Check for location context FIRST
+            folder_context = None
+            desktop_match = re.search(r'(?:desktop|on\s+my\s+desktop)', intent, re.IGNORECASE)
+            docs_match = re.search(r'(?:documents|doc|my\s+documents)', intent, re.IGNORECASE)
+            downloads_match = re.search(r'(?:downloads|my\s+downloads)', intent, re.IGNORECASE)
+
+            if desktop_match:
+                folder_context = get_windows_known_folder("Desktop")
+            elif docs_match:
+                folder_context = get_windows_known_folder("Documents")
+            elif downloads_match:
+                folder_context = get_windows_known_folder("Downloads")
+
+            # Build full path based on context
+            if folder_context:
+                full_path = folder_context / folder_name
+            elif Path(name).is_absolute():
+                full_path = Path(name)
+            else:
+                # Default to Desktop if no context found
+                folder_context = get_windows_known_folder("Desktop")
+                full_path = folder_context / folder_name if folder_context else Path(name)
+
             return [
                 TaskStep(
-                    1, "Create folder/file",
-                    "create_folder", {"path": intent}
+                    1, f"Create folder {folder_name}",
+                    "create_folder", {"path": str(full_path)}
                 )
             ]
 

@@ -72,6 +72,7 @@ def get_windows_known_folder_path(folder_id: str) -> Optional[Path]:
     try:
         import ctypes
         from ctypes import wintypes
+        from uuid import UUID
 
         # GUID mapping for common folders
         folder_guids = {
@@ -80,54 +81,34 @@ def get_windows_known_folder_path(folder_id: str) -> Optional[Path]:
             "FOLDERID_Downloads": "{338E6FE1-3C68-4A47-B188-7540A5DD143}",
             "FOLDERID_AppData_Roaming": "{FC4781D-32FE-40D6-BFE3-8FB749A51591}",
             "FOLDERID_AppData_Local": "{C0698386-5A63-40AC-B948-E3115505689F}",
+            "FOLDERID_AppData_Local_Machine": "{62598461-039D-474B-9415-5602349A3313}",
         }
 
         guid_str = folder_guids.get(folder_id)
         if not guid_str:
             return None
 
-        # Convert GUID string to GUID structure
-        guid = wintypes.GUID()
-        ctypes.windll.shell32.SHGetKnownFolderPath(
-            guid, 0, None, ctypes.byref(guid)
-        )
-
-        # Actually use the correct approach - convert string GUID to GUID
-        from uuid import UUID
+        # Parse the GUID string and create a properly formatted GUID structure
         guid_obj = UUID(guid_str)
-        guid = wintypes.GUID(guid_obj.int, guid_obj.bytes_le[3], guid_obj.bytes_le[2],
-                             (guid_obj.bytes_le[1], guid_obj.bytes_le[0],
-                              guid_obj.bytes_le[7], guid_obj.bytes_le[6],
-                              guid_obj.bytes_le[5], guid_obj.bytes_le[4],
-                              guid_obj.bytes_le[3], guid_obj.bytes_le[2],
-                              guid_obj.bytes_le[1], guid_obj.bytes_le[0]))
 
-        # Call SHGetKnownFolderPath
+        # Create GUID with correct byte ordering for Windows API
+        # The UUID module handles the conversion properly
+        guid = wintypes.GUID()
+        guid.Data1 = guid_obj.time_low
+        guid.Data2 = guid_obj.time_mid
+        guid.Data3 = guid_obj.time_hi_version
+        guid.Data4[0] = guid_obj.clock_seq_hi_variant
+        guid.Data4[1] = guid_obj.clock_seq_low
+        # Copy the node (bytes 8-13)
+        for i in range(6):
+            guid.Data4[2 + i] = guid_obj.node[i]
+
+        # Call SHGetKnownFolderPath with correct parameters
         buffer = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
-        result = ctypes.windll.shell32.SHGetKnownFolderPath(guid, 0, None, buffer)
-
-        if result == 0:
-            return Path(buffer.value)
-    except Exception:
-        pass
-
-    # Fallback to PATH environment variable approach
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        # Use ctypes to call SHGetKnownFolderPath correctly
-        KNOWNFOLDERID = wintypes.GUID
-        MAX_PATH = 260
-
-        # Desktop GUID: {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
-        desktop_guid = (0xB4BFCC3A, 0xDB2C, 0x424C,
-                        (0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41))
-
-        buffer = ctypes.create_unicode_buffer(MAX_PATH)
         result = ctypes.windll.shell32.SHGetKnownFolderPath(
-            ctypes.byref(wintypes.GUID(*desktop_guid)), 0, None, buffer
+            ctypes.byref(guid), 0, None, buffer
         )
+
         if result == 0:
             return Path(buffer.value)
     except Exception:
