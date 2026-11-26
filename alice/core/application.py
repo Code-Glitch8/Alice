@@ -100,7 +100,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
         if not self.initialized and not await self.initialize():
             raise RuntimeError(self.ai_adapter.last_error or "LM Studio is unavailable")
 
-        messages = [{"role": "system", "content": self.system_prompt}] + [dict(item) for item in history]
+        messages = [{"role": "system", "content": self.system_prompt}] + [dict(item) for item in history if item.get("role") != "system"]
         tool_definitions = tools if tools is not None else self.get_tools_for_api()
         max_rounds = max(1, int(getattr(self.automation_config, "max_tool_calls", 5) or 5))
         self.current_tool_call_count = 0
