@@ -959,7 +959,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     "requires_confirmation": False
                 })
                 break
-            if not await self._is_action_permitted(tool, step.description):
+            if not await self._is_action_permitted(tool, step.description, step.parameters):
                 results.append({
                     "step_id": step.step_id, "description": step.description,
                     "tool": step.tool_name, "verified": False, "result": None,
