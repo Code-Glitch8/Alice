@@ -231,13 +231,13 @@ class TestBrowserLifecycle(unittest.TestCase):
 
         self.assertEqual(result['status'], 'success')
         self.assertTrue(result['verification']['launch_requested'])
-        self.assertTrue(result['verification']['default_profile'])
+        self.assertTrue(result['verification']['dedicated_profile'])
         self.assertFalse(result['verification']['incognito'])
         command = popen.call_args.args[0]
         self.assertIn("chrome.exe", command[0].lower())
-        self.assertIn("q=Google+ai+studio", command[1])
+        self.assertTrue(command[1].startswith("--user-data-dir="))
+        self.assertIn("q=Google+ai+studio", command[-1])
         self.assertNotIn("--incognito", command)
-        self.assertNotIn("--user-data-dir", command)
 
 
 class TestAsyncExecution(unittest.TestCase):
