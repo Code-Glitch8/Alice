@@ -328,8 +328,17 @@ class ComputerEngine:
         try:
             process = None
             if cmd_type == "protocol":
-                # Handle URI protocols like ms-settings:
-                process = subprocess.Popen(["cmd", "/c", "start", "", command], shell=False)
+                # ShellExecute handles URI schemes and AppsFolder identities
+                # directly. A cmd/start child exits immediately and cannot be
+                # used as a reliable process-running verification.
+                os.startfile(command)
+                details = {
+                    "app": app_name, "command": command, "pid": None,
+                    "name": app_name, "status": "launch_requested",
+                    "launch_method": "Windows ShellExecute",
+                }
+                self.running_apps.append(details)
+                return True, f"Sent Windows a launch request for {app_name}", details
             elif cmd_type == "msc":
                 # Handle MMC snap-ins
                 process = subprocess.Popen(["mmc", command], shell=False)
