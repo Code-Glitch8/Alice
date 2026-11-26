@@ -214,9 +214,10 @@ class ComputerEngine:
 
         # Try to find UWP/MSIX packaged applications
         try:
-            uwp_exe = self._find_uwp_app(app_lower)
-            if uwp_exe:
-                return uwp_exe, "exe"
+            uwp_command = self._find_uwp_app(app_lower)
+            if uwp_command:
+                command_type = "protocol" if uwp_command.startswith(("shell:", "ms-", "calculator:")) else "exe"
+                return uwp_command, command_type
         except Exception:
             pass
 
