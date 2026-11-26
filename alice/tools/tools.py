@@ -94,7 +94,8 @@ class OpenAppTool(Tool):
                 "message": message,
                 "result": details if success else None,
                 "verification": {
-                    "process_running": success,
+                    "process_running": bool(success and details.get("pid")),
+                    "launch_requested": bool(success),
                     "pid": details.get("pid") if success else None
                 },
                 "error": None if success else message
