@@ -282,7 +282,7 @@ class TaskPlanner:
         # Priority 1: Pattern "create folder/file called X" or "create folder called X anywhere"
         # This handles "Create a folder called Physics Notes on my Desktop"
         name_match = re.search(
-            r'(?:folder|file)\s+(?:called\s+|\'c\s+|\'c[,.]?\s+|\'?\s+)?["\']?((?:[^"\'.,\s]+\s*){1,5})["\']?',
+            r'(?:folder|file)\s+(?:(?:called|named)\s+|\'c\s+|\'c[,.]?\s+|\'?\s+)?["\']?((?:[^"\'.,\s]+\s*){1,5})["\']?',
             intent, re.IGNORECASE
         )
 
