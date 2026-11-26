@@ -106,6 +106,26 @@ def test_model_tool_call_also_requests_category_b_approval():
     assert results[0]["tool_call_id"] == "type_1"
 
 
+
+def test_one_shot_intent_requests_category_b_approval():
+    app = make_app()
+    app.permission_confirmation_callback = AsyncMock(return_value=True)
+    app.tool_dispatcher.execute_async = AsyncMock(
+        return_value={"status": "success", "message": "Closed ALICE Chrome"}
+    )
+
+    result = asyncio.run(app.execute_intent("close Chrome"))
+
+    app.permission_confirmation_callback.assert_awaited_once_with(
+        "close_app", "Close chrome"
+    )
+    app.tool_dispatcher.execute_async.assert_awaited_once_with(
+        "close_app", {"app_name": "chrome"}
+    )
+    assert result["steps"][0]["verified"] is True
+
+
+
 def test_category_c_remains_blocked_even_if_callback_would_approve():
     class CategoryCTool(Tool):
         def __init__(self):
