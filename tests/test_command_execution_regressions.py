@@ -202,6 +202,45 @@ def test_chrome_launcher_does_not_claim_success_when_not_installed():
     assert "Chrome was not found" in result["error"]
 
 
+def test_notepad_write_respects_category_b_permission():
+    app = make_app()
+    app.automation_config.require_confirm_category_b = True
+    app.tool_dispatcher.execute_async = AsyncMock(
+        return_value={"status": "success", "message": "Step ran"}
+    )
+
+    result = asyncio.run(app._execute_planned_tasks(
+        [{"role": "user", "content": "open notepad and write my favourite color"}],
+        "open notepad and write my favourite color",
+        []
+    ))
+
+    called_tools = [call.args[0] for call in app.tool_dispatcher.execute_async.await_args_list]
+    assert called_tools == ["open_app", "focus_app"]
+    assert "permission" in result.lower()
+    assert "did not claim the step was completed" in result.lower()
+
+
+def test_chat_filters_old_system_messages_from_history():
+    app = make_app()
+    sent = []
+
+    async def fake_chat(messages, **_kwargs):
+        sent.append([dict(message) for message in messages])
+        return "Hello."
+
+    app.runtime.chat = fake_chat
+    result = asyncio.run(app.chat_with_tools([
+        {"role": "system", "content": "An old system prompt"},
+        {"role": "user", "content": "Hi"},
+    ]))
+
+    assert result == "Hello."
+    assert len([message for message in sent[0] if message.get("role") == "system"]) == 1
+    assert sent[0][0]["content"] == app.system_prompt
+
+
+
 def test_sync_tool_runs_off_the_async_event_loop_thread():
     class ThreadCheckingTool(Tool):
         def __init__(self):
