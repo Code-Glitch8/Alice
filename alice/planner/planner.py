@@ -80,6 +80,8 @@ class TaskPlanner:
             steps = self._plan_browser_screenshot(user_intent)
         elif any(kw in intent_lower for kw in ["extract from ", "summarize ", "read page", "get content"]):
             steps = self._plan_browser_extract(user_intent)
+        elif any(kw in intent_lower for kw in ["close ", "quit ", "exit "]):
+            steps = self._plan_close_app(user_intent)
         elif any(kw in intent_lower for kw in ["open", "launch", "start"]):
             steps = self._plan_open_app(user_intent)
         elif any(kw in intent_lower for kw in ["browser", "search chrome", "search web"]):
@@ -102,7 +104,7 @@ class TaskPlanner:
         """Extract application name from user intent."""
         intent = intent.lower().strip()
         # Remove common prefixes
-        for prefix in ["open ", "launch ", "start "]:
+        for prefix in ["open ", "launch ", "start ", "close ", "quit ", "exit "]:
             if intent.startswith(prefix):
                 intent = intent[len(prefix):]
                 break
@@ -114,6 +116,14 @@ class TaskPlanner:
                 break
 
         return intent.strip()
+
+    def _plan_close_app(self, intent: str) -> List[TaskStep]:
+        """Plan closing an application through its registered ownership-aware tool."""
+        app_name = self._extract_app_name(intent)
+        return [
+            TaskStep(1, f"Close {app_name}", "close_app", {"app_name": app_name},
+                     requires_confirmation=True)
+        ]
 
     def _plan_open_app(self, intent: str) -> List[TaskStep]:
         """Plan opening an application and optional text entry/save actions."""
