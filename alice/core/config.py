@@ -56,66 +56,62 @@ class VoiceConfig:
 
 
 def get_windows_known_folder_path(folder_id: str) -> Optional[Path]:
-    """Get a Windows known folder path using SHGetKnownFolderPath API.
+    """Resolve a Windows Known Folder using SHGetKnownFolderPath.
 
-    This is more reliable than hardcoded paths like Path.home() / "Desktop".
-
-    Args:
-        folder_id: KNOWNFOLDERID string (e.g., "FOLDERID_Desktop", "FOLDERID_Downloads")
-
-    Returns:
-        Path to the known folder, or None if not found
+    The API returns an allocated PWSTR through an output pointer (not into a
+    caller-provided fixed-size buffer). Always release that allocation with
+    CoTaskMemFree. This also respects OneDrive and other folder redirections.
     """
     if os.name != "nt":
         return None
 
+    folder_guids = {
+        "FOLDERID_Desktop": "B4BFCC3A-DB2C-424C-B029-7FE99A87C641",
+        "FOLDERID_Documents": "FDD39AD8-70D2-4664-B824-9D18820A6B39",
+        "FOLDERID_Downloads": "374DE290-123F-4565-9164-39C4925E467B",
+    }
+    guid_text = folder_guids.get(folder_id)
+    if not guid_text:
+        return None
+
+    import ctypes
+    import uuid
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", wintypes.BYTE * 8),
+        ]
+
+    parsed = uuid.UUID(guid_text)
+    data1, data2, data3 = __import__("struct").unpack("<IHH", parsed.bytes_le[:8])
+    guid = GUID(data1, data2, data3, (wintypes.BYTE * 8)(*parsed.bytes_le[8:]))
+    path_ptr = wintypes.LPWSTR()
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    shell32.SHGetKnownFolderPath.argtypes = [
+        ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+        ctypes.POINTER(wintypes.LPWSTR),
+    ]
+    shell32.SHGetKnownFolderPath.restype = ctypes.c_long
     try:
-        import ctypes
-        from ctypes import wintypes
-        from uuid import UUID
-
-        # GUID mapping for common folders
-        folder_guids = {
-            "FOLDERID_Desktop": "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
-            "FOLDERID_Documents": "{FDD39AD8-70D2-4664-B824-9D18820A6B39}",
-            "FOLDERID_Downloads": "{338E6FE1-3C68-4A47-B188-7540A5DD143}",
-            "FOLDERID_AppData_Roaming": "{FC4781D-32FE-40D6-BFE3-8FB749A51591}",
-            "FOLDERID_AppData_Local": "{C0698386-5A63-40AC-B948-E3115505689F}",
-            "FOLDERID_AppData_Local_Machine": "{62598461-039D-474B-9415-5602349A3313}",
-        }
-
-        guid_str = folder_guids.get(folder_id)
-        if not guid_str:
-            return None
-
-        # Parse the GUID string and create a properly formatted GUID structure
-        guid_obj = UUID(guid_str)
-
-        # Create GUID with correct byte ordering for Windows API
-        # The UUID module handles the conversion properly
-        guid = wintypes.GUID()
-        guid.Data1 = guid_obj.time_low
-        guid.Data2 = guid_obj.time_mid
-        guid.Data3 = guid_obj.time_hi_version
-        guid.Data4[0] = guid_obj.clock_seq_hi_variant
-        guid.Data4[1] = guid_obj.clock_seq_low
-        # Copy the node (bytes 8-13)
-        for i in range(6):
-            guid.Data4[2 + i] = guid_obj.node[i]
-
-        # Call SHGetKnownFolderPath with correct parameters
-        buffer = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
-        result = ctypes.windll.shell32.SHGetKnownFolderPath(
-            ctypes.byref(guid), 0, None, buffer
+        result = shell32.SHGetKnownFolderPath(
+            ctypes.byref(guid), 0, None, ctypes.byref(path_ptr)
         )
-
-        if result == 0:
-            return Path(buffer.value)
+        if result != 0 or not path_ptr:
+            return None
+        value = path_ptr.value
+        return Path(value) if value else None
     except Exception:
-        pass
-
-    return None
-
+        return None
+    finally:
+        if path_ptr:
+            ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+            ole32.CoTaskMemFree.restype = None
+            ole32.CoTaskMemFree(path_ptr)
 
 def get_windows_known_folder(folder_name: str) -> Optional[Path]:
     """Get Windows known folder path by friendly name.
