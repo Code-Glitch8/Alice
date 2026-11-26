@@ -423,6 +423,7 @@ class TaskPlanner:
             root = get_windows_known_folder(match.group(1).title())
             if root:
                 return str(root / match.group(2)) if match.group(2) else str(root)
+            return ""
         return str(Path(value).expanduser())
 
     def _plan_move_file(self, intent: str) -> List[TaskStep]:
@@ -433,6 +434,8 @@ class TaskPlanner:
             return self._plan_general_help(intent)
         source = self._resolve_known_location(match.group(1))
         destination = self._resolve_known_location(match.group(2))
+        if not source or not destination:
+            return self._plan_general_help(intent)
         return [TaskStep(
             1, f"Move {source} to {destination}", "move_file",
             {"src": source, "dst": destination}, requires_confirmation=True
@@ -451,10 +454,9 @@ class TaskPlanner:
         if match:
             kind, name, location = match.groups()
             root = get_windows_known_folder(location.title())
-            if root:
-                target = str(root / Path(name.strip().strip('"').strip("'")).name)
-            else:
-                target = self._resolve_known_location(name)
+            if not root:
+                return self._plan_general_help(intent)
+            target = str(root / Path(name.strip().strip('"').strip("'")).name)
         else:
             match = re.search(
                 r"^\s*(?:delete|remove)\s+(?:(?:the|a)\s+)?(file|folder|directory)\s+(?:named|called)?\s*(.+?)\s*[.!?]*$",
@@ -464,6 +466,8 @@ class TaskPlanner:
                 return self._plan_general_help(intent)
             kind, name = match.groups()
             target = self._resolve_known_location(name)
+        if not target:
+            return self._plan_general_help(intent)
         tool_name = "delete_folder" if kind and kind.lower() in {"folder", "directory"} else "delete_file"
         return [TaskStep(
             1, f"Delete {target}", tool_name, {"path": target},
