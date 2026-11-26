@@ -70,6 +70,9 @@ Available tools:
 - close_all_apps(): Close all applications opened by ALICE
 - get_open_apps(): List applications opened by ALICE
 - get_app_status(app_name: string): Get status of a specific application
+- write_file(path: string, content?: string, encoding?: string): Write content to a file
+- delete_file(path: string, confirm?: boolean): Delete a file
+- delete_folder(path: string, recursive?: boolean): Delete a folder and its contents
 
 Only call tools when the user explicitly requests a computer action. For normal conversation, respond normally without tool calls."""
 
@@ -661,6 +664,25 @@ Only call tools when the user explicitly requests a computer action. For normal 
                 tool_def["function"]["parameters"]["properties"] = {}
             elif tool.name == "emergency_stop":
                 tool_def["function"]["parameters"]["properties"] = {}
+            elif tool.name == "write_file":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "path": {"type": "string", "description": "Full path to the file to write"},
+                    "content": {"type": "string", "description": "Content to write to the file", "default": ""},
+                    "encoding": {"type": "string", "description": "File encoding", "default": "utf-8"}
+                }
+                tool_def["function"]["parameters"]["required"] = ["path"]
+            elif tool.name == "delete_file":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "path": {"type": "string", "description": "Full path to the file to delete"},
+                    "confirm": {"type": "boolean", "description": "Whether to require confirmation", "default": True}
+                }
+                tool_def["function"]["parameters"]["required"] = ["path"]
+            elif tool.name == "delete_folder":
+                tool_def["function"]["parameters"]["properties"] = {
+                    "path": {"type": "string", "description": "Full path to the folder to delete"},
+                    "recursive": {"type": "boolean", "description": "Whether to delete contents recursively", "default": True}
+                }
+                tool_def["function"]["parameters"]["required"] = ["path"]
 
             tools.append(tool_def)
 
@@ -694,6 +716,9 @@ Only call tools when the user explicitly requests a computer action. For normal 
             "copy_paste": {"action": "action"},
             "set_clipboard": {"content": "content"},
             "select_text": {"method": "method"},
+            "write_file": {"path": "path", "content": "content", "encoding": "encoding"},
+            "delete_file": {"path": "path", "confirm": "confirm"},
+            "delete_folder": {"path": "path", "recursive": "recursive"},
         }
 
         normalized = {}

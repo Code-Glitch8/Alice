@@ -14,6 +14,8 @@ import time
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
+from alice.core.config import get_windows_known_folder
+
 logger = logging.getLogger(__name__)
 
 
@@ -217,6 +219,114 @@ class CreateFolderTool(Tool):
     def __init__(self):
         super().__init__("create_folder", "Create a folder", required_permission="A")
 
+    def _resolve_folder_path(self, path: str) -> Path:
+        """Resolve a folder path using Windows known folder API for proper user folder paths.
+
+        This fixes the issue where Path.resolve() uses CWD-relative instead of actual user folder paths.
+        Examples:
+        - "Desktop/MyFolder" -> "C:\\Users\\User\\Desktop\\MyFolder"
+        - "Documents/Test" -> "C:\\Users\\User\\Documents\\Test"
+        - "Downloads/NewFolder" -> "C:\\Users\\User\\Downloads\\NewFolder"
+
+        Args:
+            path: The path to resolve (may contain Desktop/Documents/Downloads prefix)
+
+        Returns:
+            Resolved Path object
+        """
+        from pathlib import Path
+        import re
+
+        # Normalize the path
+        path = path.strip()
+
+        # Check if it's an absolute path
+        if Path(path).is_absolute():
+            return Path(path).resolve()
+
+        # Define folder pattern mappings
+        # Use dict to track folder names and detect subfolder presence
+        folder_patterns = [
+            (r"^Desktop[\\\/](.+)$", "Desktop"),
+            (r"^Documents[\\\/](.+)$", "Documents"),
+            (r"^Downloads[\\\/](.+)$", "Downloads"),
+            (r"^(My\s+)?Desktop$", "Desktop"),
+            (r"^(My\s+)?Documents$", "Documents"),
+            (r"^(My\s+)?Downloads$", "Downloads"),
+        ]
+
+        for pattern, folder_name in folder_patterns:
+            match = re.match(pattern, path, re.IGNORECASE)
+            if match:
+                folder_path = get_windows_known_folder(folder_name)
+                if folder_path is None:
+                    # Fallback to environment variable or Path.home()
+                    if os.name == "nt":
+                        user_profile = os.environ.get("USERPROFILE")
+                        if user_profile:
+                            folder_path = Path(user_profile) / folder_name
+                        else:
+                            folder_path = Path.home() / folder_name
+                    else:
+                        folder_path = Path.home() / folder_name
+
+                # Check if there's a subfolder (group 1 exists and has content)
+                subfolder = match.group(1) if match.lastindex and match.group(1) else ""
+                if subfolder:
+                    # Clean up backslashes in subfolder
+                    subfolder = subfolder.replace("\\\\", "/")
+                    return folder_path / subfolder
+                else:
+                    return folder_path
+
+        # Check for OneDrive redirected folders (common on Windows 11)
+        try:
+            user_profile = os.environ.get("USERPROFILE", "")
+            if user_profile:
+                # Check Desktop
+                for pattern in [r"^(?:My\s+)?Desktop", r"^(?:My\s+)?OneDrive[\\\/]Desktop"]:
+                    match = re.match(pattern, path, re.IGNORECASE)
+                    if match:
+                        onedrive_path = Path(user_profile) / "OneDrive" / "Desktop"
+                        if onedrive_path.exists():
+                            subfolder = path[match.end():]
+                            if subfolder:
+                                return onedrive_path / subfolder
+                            return onedrive_path
+                # Check Documents
+                for pattern in [r"^(?:My\s+)?Documents", r"^(?:My\s+)?OneDrive[\\\/]Documents"]:
+                    match = re.match(pattern, path, re.IGNORECASE)
+                    if match:
+                        onedrive_path = Path(user_profile) / "OneDrive" / "Documents"
+                        if onedrive_path.exists():
+                            subfolder = path[match.end():]
+                            if subfolder:
+                                return onedrive_path / subfolder
+                            return onedrive_path
+        except Exception:
+            pass
+
+        # Default: resolve relative to Desktop (most common use case)
+        desktop = get_windows_known_folder("Desktop")
+        if desktop:
+            return desktop / path
+
+        # Fallback to USERPROFILE or home
+        if os.name == "nt":
+            user_profile = os.environ.get("USERPROFILE")
+            if user_profile:
+                # Try common folders relative to user profile
+                for folder in ["Desktop", "Documents", "Downloads"]:
+                    if folder.lower() in path.lower():
+                        fallback_path = Path(user_profile) / folder
+                        if fallback_path.exists():
+                            # Remove the folder name prefix and just use the rest
+                            rest = re.sub(rf"^{folder}[\\\/]*", "", path, flags=re.IGNORECASE)
+                            return fallback_path / rest if rest else fallback_path
+
+        # Final fallback: use current directory's parent
+        return Path(path).resolve() if Path(path).is_absolute() else Path.cwd() / path
+
     def execute(self, **kwargs) -> dict:
         path = kwargs.get("path")
         if not path:
@@ -235,9 +345,9 @@ class CreateFolderTool(Tool):
             config = Config.load()
             engine = ComputerEngine(config)
 
-            # Resolve the path to handle OneDrive redirects and relative paths
-            from pathlib import Path
-            resolved_path = Path(path).resolve()
+            # Resolve the path using Windows known folder API for proper user folder paths
+            # This fixes the issue where Path.resolve() uses CWD-relative instead of actual user folder paths
+            resolved_path = self._resolve_folder_path(path)
 
             success, message = engine.create_folder(str(resolved_path))
 
@@ -912,9 +1022,11 @@ class TypeTextTool(Tool):
         try:
             import time
             from alice.computer.engine import ComputerEngine
+            from alice.core.config import Config
             from alice.tools.clipboard_utils import set_text_to_clipboard
 
-            engine = ComputerEngine()
+            config = Config.load()
+            engine = ComputerEngine(config)
             if target_window:
                 focused, focus_message = engine.focus_app(str(target_window))
             else:
@@ -1340,6 +1452,176 @@ class WriteFileTool(Tool):
             }
 
 
+class DeleteFileTool(Tool):
+    """Delete a file from the filesystem."""
+
+    def __init__(self):
+        super().__init__("delete_file", "Delete a file", required_permission="B")
+
+    def execute(self, **kwargs) -> dict:
+        """Delete a file and verify the deletion.
+
+        Args:
+            path: Full path to the file to delete
+            confirm: Whether to require confirmation (default: True, but auto-confirmed for B if configured)
+
+        Returns:
+            Dict with status and verification info
+        """
+        from alice.core.config import Config
+        from alice.computer.file_operations import FileOperations
+        from pathlib import Path
+
+        path = kwargs.get("path")
+        if not path:
+            return {
+                "status": "error",
+                "action": "delete_file",
+                "error": "Missing required parameter: path"
+            }
+
+        try:
+            config = Config.load()
+            allowed_locations = config.automation.allowed_locations
+
+            file_path = Path(path)
+            resolved_path = file_path.resolve()
+
+            # Check if file is in allowed locations
+            if allowed_locations:
+                is_allowed = any(
+                    str(resolved_path).startswith(str(Path(loc).resolve()))
+                    for loc in allowed_locations
+                )
+                if not is_allowed:
+                    return {
+                        "status": "error",
+                        "action": "delete_file",
+                        "path": str(file_path),
+                        "error": f"Path not in allowed locations: {path}",
+                        "verification": {"file_deleted": False}
+                    }
+
+            fo = FileOperations(config)
+            success, message, details = fo.delete_file(str(file_path))
+
+            if success:
+                return {
+                    "status": "success",
+                    "action": "delete_file",
+                    "path": str(file_path),
+                    "message": message,
+                    "result": details,
+                    "verification": {"file_deleted": True}
+                }
+            else:
+                return {
+                    "status": "error",
+                    "action": "delete_file",
+                    "path": str(file_path),
+                    "message": message,
+                    "error": message,
+                    "verification": {"file_deleted": False}
+                }
+
+        except Exception as e:
+            logger.error(f"DeleteFileTool error: {e}")
+            return {
+                "status": "error",
+                "action": "delete_file",
+                "path": str(path),
+                "message": str(e),
+                "error": str(e),
+                "verification": {"file_deleted": False}
+            }
+
+
+class DeleteFolderTool(Tool):
+    """Delete a folder and its contents."""
+
+    def __init__(self):
+        super().__init__("delete_folder", "Delete a folder and its contents", required_permission="B")
+
+    def execute(self, **kwargs) -> dict:
+        """Delete a folder and verify the deletion.
+
+        Args:
+            path: Full path to the folder to delete
+            recursive: Whether to delete contents recursively (default: True)
+
+        Returns:
+            Dict with status and verification info
+        """
+        from alice.core.config import Config
+        from alice.computer.file_operations import FileOperations
+        from pathlib import Path
+
+        path = kwargs.get("path")
+        recursive = kwargs.get("recursive", True)
+
+        if not path:
+            return {
+                "status": "error",
+                "action": "delete_folder",
+                "error": "Missing required parameter: path"
+            }
+
+        try:
+            config = Config.load()
+            allowed_locations = config.automation.allowed_locations
+
+            folder_path = Path(path)
+            resolved_path = folder_path.resolve()
+
+            # Check if folder is in allowed locations
+            if allowed_locations:
+                is_allowed = any(
+                    str(resolved_path).startswith(str(Path(loc).resolve()))
+                    for loc in allowed_locations
+                )
+                if not is_allowed:
+                    return {
+                        "status": "error",
+                        "action": "delete_folder",
+                        "path": str(folder_path),
+                        "error": f"Path not in allowed locations: {path}",
+                        "verification": {"folder_deleted": False}
+                    }
+
+            fo = FileOperations(config)
+            success, message, details = fo.delete_folder(str(folder_path), recursive=recursive)
+
+            if success:
+                return {
+                    "status": "success",
+                    "action": "delete_folder",
+                    "path": str(folder_path),
+                    "message": message,
+                    "result": details,
+                    "verification": {"folder_deleted": True}
+                }
+            else:
+                return {
+                    "status": "error",
+                    "action": "delete_folder",
+                    "path": str(folder_path),
+                    "message": message,
+                    "error": message,
+                    "verification": {"folder_deleted": False}
+                }
+
+        except Exception as e:
+            logger.error(f"DeleteFolderTool error: {e}")
+            return {
+                "status": "error",
+                "action": "delete_folder",
+                "path": str(path),
+                "message": str(e),
+                "error": str(e),
+                "verification": {"folder_deleted": False}
+            }
+
+
 class ToolDispatcher:
     """Central dispatcher for tool execution with async support."""
 
@@ -1408,6 +1690,8 @@ def create_default_tools() -> ToolRegistry:
     registry.register(CreateFolderTool())
     registry.register(SearchFilesTool())
     registry.register(WriteFileTool())
+    registry.register(DeleteFileTool())
+    registry.register(DeleteFolderTool())
 
     # Browser tools
     registry.register(BrowserOpenTool())

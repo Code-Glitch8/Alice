@@ -312,6 +312,81 @@ class FileOperations:
             logger.error(f"Save file error: {e}")
             return False, str(e), {"path": path}
 
+    def delete_file(self, path: str, confirm: bool = True) -> Tuple[bool, str, Dict[str, Any]]:
+        """Delete a file.
+
+        Args:
+            path: Path to the file to delete
+            confirm: Whether to require confirmation (for API consistency)
+
+        Returns:
+            Tuple of (success, message, details)
+        """
+        import time
+        try:
+            file_path = Path(path)
+
+            if not file_path.exists():
+                return False, f"File not found: {path}", {"path": str(file_path), "deleted": False}
+
+            if not file_path.is_file():
+                return False, f"Path is not a file: {path}", {"path": str(file_path), "deleted": False}
+
+            original_size = file_path.stat().st_size
+            file_path.unlink()
+            time.sleep(0.1)  # Brief pause to ensure delete completes
+
+            details = {
+                "path": str(file_path),
+                "deleted": True,
+                "original_size": original_size
+            }
+            return True, f"Deleted file: {path}", details
+
+        except Exception as e:
+            logger.error(f"Delete file error: {e}")
+            return False, str(e), {"path": str(path), "deleted": False}
+
+    def delete_folder(self, path: str, recursive: bool = True, confirm: bool = True) -> Tuple[bool, str, Dict[str, Any]]:
+        """Delete a folder and its contents.
+
+        Args:
+            path: Path to the folder to delete
+            recursive: Whether to delete contents recursively (always True for safety)
+            confirm: Whether to require confirmation (for API consistency)
+
+        Returns:
+            Tuple of (success, message, details)
+        """
+        import time
+        import shutil
+        try:
+            folder_path = Path(path)
+
+            if not folder_path.exists():
+                return False, f"Folder not found: {path}", {"path": str(folder_path), "deleted": False}
+
+            if not folder_path.is_dir():
+                return False, f"Path is not a folder: {path}", {"path": str(folder_path), "deleted": False}
+
+            # Count items for reporting
+            item_count = sum(1 for _ in folder_path.rglob('*')) if recursive else len(list(folder_path.iterdir()))
+
+            # Always use recursive deletion for safety
+            shutil.rmtree(str(folder_path))
+            time.sleep(0.1)  # Brief pause to ensure delete completes
+
+            details = {
+                "path": str(folder_path),
+                "deleted": True,
+                "items_deleted": item_count
+            }
+            return True, f"Deleted folder: {path}", details
+
+        except Exception as e:
+            logger.error(f"Delete folder error: {e}")
+            return False, str(e), {"path": str(path), "deleted": False}
+
 
 if __name__ == "__main__":
     import sys

@@ -465,6 +465,305 @@ class ComputerEngine:
         except Exception as e:
             return False, f"Failed to focus {app_name}: {e}"
 
+    def auto_focus_most_relevant(self) -> bool:
+        """Focus the most recently opened application or the most relevant window.
+
+        This method finds the most appropriate target window for text input.
+        Priority:
+        1. Recently opened applications by ALICE
+        2. Windows with ALICE in the title (if any)
+        3. The currently active/focused window
+
+        Returns:
+            True if a window was successfully focused, False otherwise
+        """
+        try:
+            import pywinauto
+            from pywinauto import Desktop
+            from alice.core.application_owner import ApplicationOwner
+
+            # First, check ALICE's owned applications
+            owner = ApplicationOwner.get_instance()
+            owned_apps = owner.get_owned_apps()
+
+            if owned_apps:
+                # Find the most recently opened owned app that's still running
+                for app_record in reversed(owned_apps):
+                    app_name = app_record.get("app")
+                    try:
+                        windows = Desktop(backend="uia").windows()
+                        for window in windows:
+                            try:
+                                window_text = window.window_text().lower()
+                                class_name = (window.class_name() or "").lower()
+                                if app_name.lower() in window_text or app_name.lower() in class_name:
+                                    window.set_focus()
+                                    logger.debug(f"Auto-focused ALICE-owned app: {app_name}")
+                                    return True
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+
+            # Try to focus windows that might be relevant for typing
+            # Look for windows with common editor names
+            editor_names = ["notepad", "word", "wordpad", "paint", "code", "visual studio",
+                           "document", "text", "editor", "chrome", "firefox", "edge"]
+
+            try:
+                windows = Desktop(backend="uia").windows()
+                for window in windows:
+                    try:
+                        window_text = window.window_text().lower()
+                        # Skip invisible or minimized windows
+                        if not window.is_visible():
+                            continue
+                        # Check for editor-related windows
+                        for editor in editor_names:
+                            if editor in window_text:
+                                window.set_focus()
+                                logger.debug(f"Auto-focused editor window: {window.window_text()}")
+                                return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Fall back to getting the active window
+            try:
+                desktop = Desktop(backend="uia")
+                # Get the top-level windows and try to set focus to the active one
+                windows = desktop.windows()
+                if windows:
+                    # Try to focus the first visible window (likely the most recently active)
+                    for window in windows:
+                        try:
+                            if window.is_visible() and window.is_enabled():
+                                window.set_focus()
+                                logger.debug(f"Auto-focused active window: {window.window_text()}")
+                                return True
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            return False
+        except ImportError:
+            logger.warning("pywinauto not available for auto-focus")
+            return False
+        except Exception as e:
+            logger.debug(f"Auto-focus failed: {e}")
+            return False
+
+    def list_installed_apps(self) -> List[Dict[str, Any]]:
+        """Discover and list installed applications on the system.
+
+        Uses multiple discovery methods:
+        1. Windows registry App Paths and Uninstall entries
+        2. Start Menu shortcuts
+        3. PATH environment variable
+
+        Returns:
+            List of installed applications with name, path, and type
+        """
+        apps = []
+        seen_names = set()
+
+        # Method 1: Check registry for installed applications
+        try:
+            import winreg
+
+            # Check App Paths
+            reg_paths = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            ]
+
+            for root, reg_path in reg_paths:
+                try:
+                    with winreg.OpenKey(root, reg_path) as key:
+                        i = 0
+                        while True:
+                            try:
+                                subkey_name = winreg.EnumKey(key, i)
+                                with winreg.OpenKey(key, subkey_name) as subkey:
+                                    # Try to get display name
+                                    try:
+                                        display_name, _ = winreg.QueryValueEx(subkey, "DisplayName")
+                                        install_location, _ = winreg.QueryValueEx(subkey, "InstallLocation")
+                                        install_string, _ = winreg.QueryValueEx(subkey, "InstallLocation")
+                                    except (FileNotFoundError, OSError):
+                                        display_name = subkey_name
+                                        install_location = ""
+                                        install_string = ""
+
+                                    # Try to get executable path
+                                    try:
+                                        exe_path, _ = winreg.QueryValueEx(subkey, "")
+                                        if exe_path and Path(exe_path).exists():
+                                            app_key = display_name.lower().strip() if display_name else subkey_name.lower()
+                                            if app_key not in seen_names:
+                                                seen_names.add(app_key)
+                                                apps.append({
+                                                    "name": display_name or subkey_name,
+                                                    "path": exe_path,
+                                                    "type": "registry",
+                                                    "install_location": install_location
+                                                })
+                                    except (FileNotFoundError, OSError):
+                                        pass
+
+                                i += 1
+                            except OSError:
+                                break
+                except OSError:
+                    continue
+        except Exception as e:
+            logger.debug(f"Registry discovery error: {e}")
+
+        # Method 2: Check Start Menu shortcuts
+        try:
+            start_menu_paths = self._get_start_menu_paths()
+            for menu_path in start_menu_paths:
+                if not menu_path.exists():
+                    continue
+                for root, dirs, files in os.walk(menu_path):
+                    for filename in files:
+                        if filename.lower().endswith('.lnk'):
+                            filepath = Path(root) / filename
+                            app_name = filename.replace('.lnk', '').strip()
+                            if app_name not in seen_names:
+                                try:
+                                    import pythoncom
+                                    from win32com.shell import shell
+                                    shortcut = shell.CreateShortCut(str(filepath))
+                                    if shortcut and shortcut.Targetpath:
+                                        seen_names.add(app_name.lower())
+                                        apps.append({
+                                            "name": app_name,
+                                            "path": shortcut.Targetpath,
+                                            "type": "start_menu",
+                                            "shortcut": str(filepath)
+                                        })
+                                except Exception:
+                                    pass
+        except Exception as e:
+            logger.debug(f"Start Menu discovery error: {e}")
+
+        # Method 3: Add known aliases
+        for alias, exe in self.APP_ALIASES.items():
+            alias_lower = alias.lower()
+            if alias_lower not in seen_names:
+                seen_names.add(alias_lower)
+                apps.append({
+                    "name": alias,
+                    "path": exe,
+                    "type": "alias"
+                })
+
+        # Method 4: Check PATH for executables
+        try:
+            path_dirs = os.environ.get("PATH", "").split(";")
+            for path_dir in path_dirs[:50]:  # Limit to prevent performance issues
+                path_dir = Path(path_dir)
+                if not path_dir.exists() or not path_dir.is_dir():
+                    continue
+                for exe_file in list(path_dir.glob("*.exe"))[:10]:  # Limit per directory
+                    app_name = exe_file.stem
+                    if app_name.lower() not in seen_names:
+                        seen_names.add(app_name.lower())
+                        apps.append({
+                            "name": app_name,
+                            "path": str(exe_file),
+                            "type": "path"
+                        })
+        except Exception:
+            pass
+
+        return apps
+
+    def find_app(self, app_name: str) -> Optional[Dict[str, Any]]:
+        """Find an installed application by name.
+
+        Args:
+            app_name: The application name to search for
+
+        Returns:
+            Dictionary with app info or None if not found
+        """
+        app_lower = app_name.lower().strip()
+
+        # Check known aliases first
+        if app_lower in self.APP_ALIASES:
+            return {
+                "name": app_name,
+                "path": self.APP_ALIASES[app_lower],
+                "type": "alias"
+            }
+
+        # Check running apps first
+        for app in self.running_apps:
+            if app_lower in app.get("name", "").lower():
+                return {
+                    "name": app.get("name"),
+                    "path": app.get("command", ""),
+                    "type": "running",
+                    "pid": app.get("pid")
+                }
+
+        # Check registry
+        try:
+            import winreg
+            reg_paths = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"),
+            ]
+
+            for root, reg_path in reg_paths:
+                try:
+                    with winreg.OpenKey(root, reg_path) as key:
+                        i = 0
+                        while True:
+                            try:
+                                subkey_name = winreg.EnumKey(key, i)
+                                if app_lower in subkey_name.lower():
+                                    with winreg.OpenKey(key, subkey_name) as subkey:
+                                        exe_path, _ = winreg.QueryValueEx(subkey, "")
+                                        if exe_path and Path(exe_path).exists():
+                                            return {
+                                                "name": subkey_name,
+                                                "path": exe_path,
+                                                "type": "registry"
+                                            }
+                                i += 1
+                            except OSError:
+                                break
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+        # Search Start Menu
+        try:
+            start_menu_paths = self._get_start_menu_paths()
+            for menu_path in start_menu_paths:
+                if not menu_path.exists():
+                    continue
+                result = self._find_app_in_start_menu(menu_path, app_lower)
+                if result:
+                    return {
+                        "name": app_name,
+                        "path": result,
+                        "type": "start_menu"
+                    }
+        except Exception:
+            pass
+
+        return None
+
     def get_running_apps(self) -> List[Dict[str, Any]]:
         """Get list of currently running applications."""
         apps = []
