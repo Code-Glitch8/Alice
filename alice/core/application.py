@@ -140,23 +140,51 @@ Only call tools when the user explicitly requests a computer action. For normal 
         messages = [{"role": "system", "content": self.system_prompt}] + [dict(item) for item in history if item.get("role") != "system"]
         tool_definitions = tools if tools is not None else self.get_tools_for_api()
 
-        # These requests have deterministic local handlers. Running them before
-        # model tool-calling avoids repeated malformed calls from small local models.
+        # Deterministic inventory/search/file operations bypass the model loop.
         original_request = self._get_user_message(history) or ""
-        request_lower = original_request.casefold()
-        if any(phrase in request_lower for phrase in (
+        request_lower = original_request.casefold().strip()
+        inventory_request = any(phrase in request_lower for phrase in (
             "list all the apps", "list all apps", "show installed apps",
             "list installed applications", "what apps are installed",
             "all installed programs", "applications on my pc", "apps on my pc",
-        )) or (
-            any(phrase in request_lower for phrase in ("where is ", "locate ", "find ", "look for "))
-            and any(token in request_lower for token in (".pytest_cache", "folder", "directory", "file"))
-        ):
-            return await self._execute_planned_tasks(history, original_request, [])
+        ))
+        if inventory_request:
+            steps = self.task_planner.legacy_planner.plan(original_request)
+            return await self._execute_planned_tasks(
+                history, original_request, [], planned_steps=steps
+            )
 
-        # Explicit local actions have deterministic handlers. Route them through
-        # the permission-aware planner before calling the model, so small local
-        # models cannot repeatedly issue an already-completed desktop action.
+        if self._is_continue_request(request_lower):
+            previous_request = self._get_previous_user_message(history)
+            if previous_request and self._is_deterministic_search_request(previous_request):
+                steps = self.task_planner.legacy_planner.plan(previous_request)
+                return await self._execute_planned_tasks(
+                    history, previous_request, [], planned_steps=steps
+                )
+            return (
+                "There is no unfinished search to resume. ALICE completes supported file "
+                "searches in one pass; send the folder or filename again to run a fresh search."
+            )
+
+        if self._is_deterministic_search_request(original_request):
+            steps = self.task_planner.legacy_planner.plan(original_request)
+            if steps and all(step.tool_name != "general" for step in steps):
+                return await self._execute_planned_tasks(
+                    history, original_request, [], planned_steps=steps
+                )
+
+        if self._is_deterministic_filesystem_request(original_request):
+            recent_folder = self._get_recent_created_folder(history)
+            steps = self.task_planner.legacy_planner.plan(
+                original_request, context_folder=recent_folder
+            )
+            if steps and all(step.tool_name != "general" for step in steps):
+                return await self._execute_planned_tasks(
+                    history, original_request, [], planned_steps=steps
+                )
+
+        # Explicit local actions use the existing permission-aware planner.
+        # Small local models no longer need to infer a one-step launch action.
         if self._is_deterministic_action_request(original_request):
             planned_steps = self.task_planner.plan(original_request)
             if planned_steps and all(step.tool_name != "general" for step in planned_steps):
@@ -311,9 +339,73 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         return False
 
+
+    def _get_previous_user_message(self, history: List[Dict[str, str]]) -> Optional[str]:
+        """Return the user message immediately before the current one."""
+        user_messages = [
+            str(message.get("content") or "")
+            for message in history
+            if message.get("role") == "user"
+        ]
+        return user_messages[-2] if len(user_messages) >= 2 else None
+
+    def _get_recent_created_folder(self, history: List[Dict[str, str]]) -> Optional[str]:
+        """Find the most recent folder path ALICE explicitly reported creating."""
+        import re
+        for message in reversed(history):
+            if message.get("role") != "assistant":
+                continue
+            content = str(message.get("content") or "")
+            matches = list(re.finditer(
+                r"Created folder:\s*(.+?)(?=\s+on my\b|[\r\n]|$)",
+                content,
+                flags=re.IGNORECASE,
+            ))
+            if matches:
+                path = matches[-1].group(1).strip().strip("\"'")
+                return path.rstrip(" .;")
+        return None
+
+    def _is_continue_request(self, request: str) -> bool:
+        import re
+        normalized = " ".join((request or "").casefold().strip().split())
+        normalized = re.sub(r"^(?:(?:hey\s+)?alice)[\s,:-]+", "", normalized)
+        return normalized in {
+            "continue", "continue the search", "continue searching",
+            "keep going", "resume", "resume the search",
+        }
+
+    def _is_deterministic_search_request(self, request: str) -> bool:
+        """Route search intent directly instead of asking a small model to loop."""
+        import re
+        normalized = " ".join((request or "").casefold().strip().split())
+        normalized = re.sub(r"^(?:(?:hey\s+)?alice)[\s,:-]+", "", normalized)
+        if normalized.startswith("please "):
+            normalized = normalized[7:]
+        return normalized.startswith((
+            "search for ", "search the web for ", "search web for ",
+            "find ", "look for ", "locate ", "where is ",
+        ))
+
+    def _is_deterministic_filesystem_request(self, request: str) -> bool:
+        """Route explicit folder/file creation through the deterministic parser."""
+        import re
+        normalized = " ".join((request or "").casefold().strip().split())
+        normalized = re.sub(r"^(?:(?:hey\s+)?alice)[\s,:-]+", "", normalized)
+        if normalized.startswith("please "):
+            normalized = normalized[7:]
+        if not normalized.startswith(("create ", "make ")):
+            return False
+        return bool(
+            re.search(r"\b(?:folder|subfolders?|directory|file)\b", normalized)
+            or re.search(r"\b[\w.-]+\.[a-z0-9]{1,8}\b", normalized)
+        )
+
     def _is_deterministic_action_request(self, request: str) -> bool:
         """Return True for explicit local actions with reliable deterministic plans."""
+        import re
         normalized = " ".join((request or "").casefold().strip().split())
+        normalized = re.sub(r"^(?:(?:hey\s+)?alice)[\s,:-]+", "", normalized)
         if normalized.startswith("please "):
             normalized = normalized[7:]
         return normalized.startswith((
@@ -339,7 +431,7 @@ Only call tools when the user explicitly requests a computer action. For normal 
             "move_file", "delete_file", "delete_folder", "type_text",
             "keyboard_shortcut", "mouse_move", "mouse_click", "mouse_scroll",
             "select_text", "copy_paste", "set_clipboard", "close_all_apps",
-            "emergency_stop",
+            "emergency_stop", "search_files",
         }
         names = [
             ((call.get("function") or {}).get("name") or "")
@@ -448,14 +540,27 @@ Only call tools when the user explicitly requests a computer action. For normal 
             step.result = result
             status = result.get("status") if isinstance(result, dict) else None
             step.verified = status in {"success", "navigated", "search_completed", "completed"}
+            message = (
+                (result.get("message") or result.get("error") or str(result))
+                if isinstance(result, dict) else str(result)
+            )
+            if step.tool_name == "search_files" and isinstance(result, dict):
+                payload = result.get("result") or {}
+                matches = payload.get("files") if isinstance(payload, dict) else []
+                if isinstance(matches, list) and matches:
+                    visible_matches = matches[:10]
+                    lines = [
+                        f"- {item.get('name', 'Unnamed')} - {item.get('path', 'Path unavailable')}"
+                        for item in visible_matches if isinstance(item, dict)
+                    ]
+                    message = f"{result.get('message', 'Search completed')}\n" + "\n".join(lines)
+                    if len(matches) > len(visible_matches):
+                        message += f"\n- ...and {len(matches) - len(visible_matches)} more returned matches"
             results.append({
                 "step": step.description,
                 "tool": step.tool_name,
                 "status": "success" if step.verified else "error",
-                "message": (
-                    (result.get("message") or result.get("error") or str(result))
-                    if isinstance(result, dict) else str(result)
-                )
+                "message": message
             })
             # Stop dependent work if opening/focusing the target application failed.
             if not step.verified:

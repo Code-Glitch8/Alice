@@ -747,6 +747,47 @@ class ComputerEngine:
         except Exception:
             pass
 
+        # Last resort: tolerate small typos, but only when one installed-app
+        # candidate is clearly close. Exact aliases/registry/Start Menu matches
+        # above always take precedence.
+        try:
+            import re
+            from difflib import SequenceMatcher
+
+            def normalize_name(value: str) -> str:
+                return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+            normalized_query = normalize_name(app_name)
+            if len(normalized_query) >= 4:
+                candidates = []
+                for app in self.list_installed_apps():
+                    if not isinstance(app, dict) or not app.get("path"):
+                        continue
+                    display_name = str(app.get("name") or "")
+                    normalized_candidate = normalize_name(display_name)
+                    if not normalized_candidate:
+                        continue
+                    score = SequenceMatcher(
+                        None, normalized_query, normalized_candidate
+                    ).ratio()
+                    # Require stronger evidence for short names to avoid
+                    # opening an unrelated app from a vague one-word request.
+                    threshold = 0.84 if len(normalized_query) < 6 else 0.76
+                    if score >= threshold:
+                        candidates.append((score, display_name.casefold(), app))
+
+                candidates.sort(key=lambda item: (-item[0], item[1]))
+                if candidates:
+                    best_score, _, best_app = candidates[0]
+                    if len(candidates) == 1 or best_score - candidates[1][0] >= 0.035:
+                        logger.info(
+                            "Resolved app name %r to installed application %r (similarity %.2f)",
+                            app_name, best_app.get("name"), best_score,
+                        )
+                        return dict(best_app)
+        except Exception as exc:
+            logger.debug("Fuzzy installed-app lookup failed for %r: %s", app_name, exc)
+
         return None
 
     def get_running_apps(self) -> List[Dict[str, Any]]:

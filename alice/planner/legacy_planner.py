@@ -90,7 +90,7 @@ class TaskPlanner:
         self.tool_registry = tool_registry
         self.steps: List[TaskStep] = []
 
-    def plan(self, user_intent: str) -> List[TaskStep]:
+    def plan(self, user_intent: str, context_folder: Optional[str] = None) -> List[TaskStep]:
         """Break down user intent into ordered, executable steps."""
         import re
         intent_lower = user_intent.lower().strip()
@@ -134,7 +134,7 @@ class TaskPlanner:
         elif any(kw in intent_lower for kw in ("browser", "search chrome", "search web")):
             steps = self._plan_browser_search(user_intent)
         elif any(kw in intent_lower for kw in ("create", "make")):
-            steps = self._plan_create(user_intent)
+            steps = self._plan_create(user_intent, context_folder=context_folder)
         elif any(kw in intent_lower for kw in ("extract", "unzip")):
             steps = self._plan_extract_zip(user_intent)
         elif any(kw in intent_lower for kw in ("help", "explain")):
@@ -310,29 +310,167 @@ class TaskPlanner:
         return steps
 
     def _plan_search_files(self, intent: str) -> List[TaskStep]:
-        """Extract a filename/folder query and optional known-folder scope."""
+        """Extract a filename/folder query and an optional drive/known-folder scope."""
         import re
         from alice.core.config import get_windows_known_folder
 
-        match = re.search(
-            r"(?:where is|locate|find|look for|search for)\s+(?:the\s+)?(.+?)\s*$",
-            intent, flags=re.IGNORECASE
-        )
-        query = match.group(1).strip() if match else intent.strip()
-        query = re.sub(r"\s+(?:folder|directory|file)$", "", query, flags=re.IGNORECASE).strip()
-        query = query.strip("\"'").strip()
         folder = None
-        lowered = intent.lower()
-        for label in ("desktop", "documents", "downloads"):
-            if label in lowered:
-                known = get_windows_known_folder(label.title())
-                if known:
-                    folder = str(known)
-                break
-        return [TaskStep(1, f"Search for {query}", "search_files", {"query": query, "folder": folder})]
+        search_text = intent
+        drive_match = re.search(
+            r"\b(?:in|on|under)\s+([A-Za-z]:[\\/](?:[^\s,;]*)?)",
+            intent,
+            flags=re.IGNORECASE,
+        )
+        if drive_match:
+            folder = drive_match.group(1).rstrip(".,;")
+            search_text = intent[:drive_match.start()]
+        else:
+            lowered = intent.casefold()
+            for label in ("desktop", "documents", "downloads"):
+                if re.search(r"\b" + label + r"\b", lowered):
+                    known = get_windows_known_folder(label.title())
+                    if known:
+                        folder = str(known)
+                    break
 
-    def _plan_create(self, intent: str) -> List[TaskStep]:
+        match = re.search(
+            r"(?:where is|locate|find|look for|search for)\s+(?:(?:the|a|an)\s+)?(.+?)\s*$",
+            search_text,
+            flags=re.IGNORECASE,
+        )
+        query = match.group(1).strip() if match else search_text.strip()
+        query = re.sub(
+            r"\s+(?:folder|directory|file|path)$", "", query, flags=re.IGNORECASE
+        ).strip()
+        query = query.strip("\"'").strip()
+        return [TaskStep(
+            1, f"Search for {query}", "search_files",
+            {"query": query, "folder": folder},
+        )]
+
+
+    def _plan_create_hierarchy(
+        self,
+        intent: str,
+        context_folder: Optional[str] = None,
+    ) -> Optional[List[TaskStep]]:
+        """Build an ordered folder/subfolder/file plan from explicit names.
+
+        context_folder is only supplied when the conversation contains a
+        previously confirmed folder-creation result and the user says "inside it".
+        """
+        import re
+        from pathlib import Path
+        from alice.core.config import get_windows_known_folder
+
+        root_match = re.search(
+            r"\b(?:create|make)\s+(?:a\s+)?folder\s+(?:named|called)\s+(.+?)"
+            r"(?=\s+(?:on|in)\s+(?:my\s+)?(?:desktop|documents|downloads)\b|\s+(?:with|containing)\s+(?:a\s+)?(?:plain\s+)?(?:text\s+)?file\b|[,;]|$)",
+            intent,
+            flags=re.IGNORECASE,
+        )
+        subfolder_match = re.search(
+            r"\bsubfolders?\s+(.+?)\s+inside\s+"
+            r"(?:it|that folder|the folder|the new folder)\b",
+            intent,
+            flags=re.IGNORECASE,
+        )
+        file_pattern = re.compile(
+            r"\b(?:create|make)\s+(?:(?:a|the)\s+)?"
+            r"(?:(?:plain\s+)?text\s+)?(?:file\s+(?:named|called)\s+)?"
+            r"(?P<file>[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9]{1,8})"
+            r"\s+(?:inside|in|within)\s+"
+            r"(?P<parent>it|the folder|that folder|(?!on\s+(?:my\s+)?(?:desktop|documents|downloads)\b)[A-Za-z][A-Za-z0-9 _-]*?)"
+            r"(?=\s*(?:,|;|\.|!|\?|$|\band\b))",
+            flags=re.IGNORECASE,
+        )
+        file_matches = list(file_pattern.finditer(intent))
+        has_details = bool(subfolder_match or file_matches)
+        if not has_details or (root_match is None and not context_folder):
+            return None
+
+        steps: List[TaskStep] = []
+        if root_match:
+            root_name = root_match.group(1).strip().strip("\"' ")
+            if not root_name:
+                return None
+            requested_root = Path(root_name).expanduser()
+            if requested_root.is_absolute():
+                root_path = requested_root
+            else:
+                location_match = re.search(
+                    r"\b(?:on|in)\s+(?:my\s+)?(desktop|documents|downloads)\b",
+                    intent[root_match.end():],
+                    flags=re.IGNORECASE,
+                )
+                location = location_match.group(1).title() if location_match else "Desktop"
+                base = get_windows_known_folder(location) or (Path.home() / location)
+                root_path = base / root_name
+            steps.append(TaskStep(
+                1, f"Create folder {root_path.name}", "create_folder",
+                {"path": str(root_path)},
+            ))
+        else:
+            root_path = Path(str(context_folder)).expanduser()
+
+        known_subfolders: Dict[str, Path] = {}
+        if subfolder_match:
+            raw_names = subfolder_match.group(1).strip().rstrip(" .;")
+            names = re.split(r"\s*,\s*|\s+and\s+|\s*&\s*", raw_names, flags=re.IGNORECASE)
+            for raw_name in names:
+                name = raw_name.strip().strip("\"' ")
+                name = re.sub(r"^(?:the\s+)", "", name, flags=re.IGNORECASE).strip()
+                if not name or name.casefold() in {"folder", "subfolder", "subfolders"}:
+                    continue
+                path = root_path / name
+                known_subfolders[name.casefold()] = path
+                steps.append(TaskStep(
+                    len(steps) + 1, f"Create subfolder {name}", "create_folder",
+                    {"path": str(path)},
+                ))
+
+        seen_directories = {str(root_path).casefold()}
+        seen_directories.update(str(path).casefold() for path in known_subfolders.values())
+        seen_files = set()
+        for match in file_matches:
+            file_name = match.group("file").strip().strip("\"' ")
+            parent_name = match.group("parent").strip().strip("\"' ")
+            if not file_name:
+                continue
+
+            parent_key = parent_name.casefold()
+            if parent_key in {"it", "the folder", "that folder"}:
+                parent_path = root_path
+            else:
+                parent_path = known_subfolders.get(parent_key)
+                if parent_path is None:
+                    parent_path = root_path / parent_name
+                    known_subfolders[parent_key] = parent_path
+                    directory_key = str(parent_path).casefold()
+                    if directory_key not in seen_directories:
+                        steps.append(TaskStep(
+                            len(steps) + 1, f"Create folder {parent_name}", "create_folder",
+                            {"path": str(parent_path)},
+                        ))
+                        seen_directories.add(directory_key)
+
+            target = parent_path / Path(file_name).name
+            file_key = str(target).casefold()
+            if file_key in seen_files:
+                continue
+            seen_files.add(file_key)
+            steps.append(TaskStep(
+                len(steps) + 1, f"Create file {target.name}", "write_file",
+                {"path": str(target), "content": ""},
+            ))
+
+        return steps or None
+
+    def _plan_create(self, intent: str, context_folder: Optional[str] = None) -> List[TaskStep]:
         """Plan creating folders and files."""
+        hierarchy_steps = self._plan_create_hierarchy(intent, context_folder=context_folder)
+        if hierarchy_steps is not None:
+            return hierarchy_steps
         import re
         import os
 
