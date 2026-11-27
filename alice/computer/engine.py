@@ -221,7 +221,93 @@ class ComputerEngine:
         except Exception:
             pass
 
+        # The normal launcher reaches _resolve_app (not find_app). Keep fuzzy
+        # matching here, after exact aliases/PATH/registry/Start Menu/UWP checks,
+        # so a typo can resolve to one clearly matching installed application.
+        fuzzy_app = self._find_fuzzy_installed_app(app_name)
+        if fuzzy_app:
+            command = str(fuzzy_app.get("path") or "").strip()
+            app_type = str(fuzzy_app.get("type") or "").casefold()
+            if command:
+                if app_type == "packaged" or command.casefold().startswith("shell:"):
+                    return command, "protocol"
+                if command.casefold().endswith(".msc"):
+                    return command, "msc"
+                return command, "exe"
+
         return None, None
+
+    def _find_fuzzy_installed_app(self, app_name: str) -> Optional[Dict[str, Any]]:
+        """Return a single high-confidence close match from installed app entries."""
+        import re
+        from difflib import SequenceMatcher
+
+        def normalize_name(value: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+        query = normalize_name(app_name)
+        # Short names are too ambiguous for fuzzy guessing; exact lookup still
+        # handles short app names such as Git, Edge, and VS Code.
+        if len(query) < 4:
+            return None
+
+        try:
+            installed_apps = self.list_installed_apps()
+        except Exception as exc:
+            logger.debug("Could not enumerate apps for fuzzy lookup: %s", exc)
+            return None
+
+        candidates = []
+        for app in installed_apps:
+            if not isinstance(app, dict):
+                continue
+            display_name = str(app.get("name") or "").strip()
+            command = str(app.get("path") or "").strip()
+            app_type = str(app.get("type") or "").casefold()
+            if not display_name or not command:
+                continue
+
+            # Only accept records with a launchable target. Registry records
+            # sometimes contain an install directory rather than an executable.
+            if app_type == "registry":
+                icon_target = command.strip('"')
+                if "," in icon_target:
+                    icon_target = icon_target.rsplit(",", 1)[0].strip().strip('"')
+                try:
+                    if not Path(icon_target).is_file():
+                        continue
+                    command = icon_target
+                except OSError:
+                    continue
+            elif app_type not in {"start_menu", "path", "packaged", "alias", "running"}:
+                continue
+
+            normalized_name = normalize_name(display_name)
+            if not normalized_name:
+                continue
+            score = SequenceMatcher(None, query, normalized_name).ratio()
+            threshold = 0.84 if len(query) < 6 else 0.76
+            if score >= threshold:
+                candidates.append((score, display_name.casefold(), dict(app, path=command)))
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        if not candidates:
+            return None
+
+        best_score, _, best_app = candidates[0]
+        # If two different applications are almost equally close, do not guess.
+        if len(candidates) > 1 and best_score - candidates[1][0] < 0.035:
+            logger.info(
+                "Ambiguous app typo %r: close matches include %r and %r",
+                app_name, best_app.get("name"), candidates[1][2].get("name"),
+            )
+            return None
+
+        logger.info(
+            "Resolved app typo %r to %r (similarity %.2f)",
+            app_name, best_app.get("name"), best_score,
+        )
+        return best_app
 
     def _get_start_menu_paths(self) -> List[Path]:
         """Get common Start Menu shortcut locations on Windows."""
@@ -747,48 +833,7 @@ class ComputerEngine:
         except Exception:
             pass
 
-        # Last resort: tolerate small typos, but only when one installed-app
-        # candidate is clearly close. Exact aliases/registry/Start Menu matches
-        # above always take precedence.
-        try:
-            import re
-            from difflib import SequenceMatcher
-
-            def normalize_name(value: str) -> str:
-                return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
-
-            normalized_query = normalize_name(app_name)
-            if len(normalized_query) >= 4:
-                candidates = []
-                for app in self.list_installed_apps():
-                    if not isinstance(app, dict) or not app.get("path"):
-                        continue
-                    display_name = str(app.get("name") or "")
-                    normalized_candidate = normalize_name(display_name)
-                    if not normalized_candidate:
-                        continue
-                    score = SequenceMatcher(
-                        None, normalized_query, normalized_candidate
-                    ).ratio()
-                    # Require stronger evidence for short names to avoid
-                    # opening an unrelated app from a vague one-word request.
-                    threshold = 0.84 if len(normalized_query) < 6 else 0.76
-                    if score >= threshold:
-                        candidates.append((score, display_name.casefold(), app))
-
-                candidates.sort(key=lambda item: (-item[0], item[1]))
-                if candidates:
-                    best_score, _, best_app = candidates[0]
-                    if len(candidates) == 1 or best_score - candidates[1][0] >= 0.035:
-                        logger.info(
-                            "Resolved app name %r to installed application %r (similarity %.2f)",
-                            app_name, best_app.get("name"), best_score,
-                        )
-                        return dict(best_app)
-        except Exception as exc:
-            logger.debug("Fuzzy installed-app lookup failed for %r: %s", app_name, exc)
-
-        return None
+        return self._find_fuzzy_installed_app(app_name)
 
     def get_running_apps(self) -> List[Dict[str, Any]]:
         """Get list of currently running applications."""

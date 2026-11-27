@@ -294,3 +294,35 @@ def test_alice_wake_word_prefix_does_not_disable_deterministic_create_routing():
         "ALICE, create a folder named ALICE_Complex_Test on my Desktop, create subfolders Documents"
     )
     assert app._is_deterministic_search_request("ALICE, search for the Alice folder in D:\\\\")
+
+
+def test_open_app_resolver_uses_fuzzy_installed_app_match(monkeypatch):
+    import alice.computer.engine as engine_module
+    from alice.computer.engine import ComputerEngine
+
+    engine = ComputerEngine.__new__(ComputerEngine)
+    engine.running_apps = []
+    monkeypatch.setattr(engine, "_get_start_menu_paths", lambda: [])
+    monkeypatch.setattr(engine, "_find_uwp_app", lambda _: None)
+    monkeypatch.setattr(engine, "list_installed_apps", lambda: [
+        {
+            "name": "Discord",
+            "path": r"C:\Program Files\Discord\Discord.exe",
+            "type": "start_menu",
+        },
+    ])
+    monkeypatch.setattr(
+        engine_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+    monkeypatch.setattr(
+        engine_module.winreg,
+        "OpenKey",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("registry unavailable")),
+    )
+
+    assert engine._resolve_app("discard") == (
+        r"C:\Program Files\Discord\Discord.exe", "exe"
+    )
+    assert engine._resolve_app("totally_unknown_application") == (None, None)
