@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -119,7 +120,7 @@ Available tools and their schemas:'''
 
     def __init__(
         self,
-        tool_registry: Optional[Dict[str, Callable]] = None,
+        tool_registry: Optional[Dict[str, Any]] = None,
         model_adapter: Optional[Any] = None,
         context_manager: Optional[Any] = None,
     ):
@@ -137,13 +138,36 @@ Available tools and their schemas:'''
         self._tool_schemas: Dict[str, Dict[str, Any]] = {}
         self._build_tool_schemas()
 
+    def _get_tool_registry_items(self) -> Dict[str, Any]:
+        """Extract tool items from tool_registry, handling both dict and ToolRegistry interfaces.
+
+        Returns a dict mapping tool_name -> tool_def, working with:
+        - Plain dict: .items() directly
+        - ToolRegistry: .tools dict attribute
+        """
+        if isinstance(self.tool_registry, dict):
+            return self.tool_registry
+        elif hasattr(self.tool_registry, 'tools'):
+            return self.tool_registry.tools
+        else:
+            # Fall back to .items() if available
+            try:
+                return dict(self.tool_registry.items())
+            except (AttributeError, TypeError):
+                return {}
+
     def _build_tool_schemas(self) -> None:
         """Build JSON schemas for all available tools."""
         if not self.tool_registry:
             logger.warning("No tool registry provided to AIPlanner")
             return
 
-        for tool_name, tool_def in self.tool_registry.items():
+        tool_items = self._get_tool_registry_items()
+        if not tool_items:
+            logger.warning("No tools found in tool registry")
+            return
+
+        for tool_name, tool_def in tool_items.items():
             if hasattr(tool_def, "schema"):
                 self._tool_schemas[tool_name] = tool_def.schema
             elif isinstance(tool_def, dict) and "schema" in tool_def:
@@ -151,6 +175,64 @@ Available tools and their schemas:'''
             elif callable(tool_def) and hasattr(tool_def, "__doc__"):
                 # Build a minimal schema for callable
                 self._tool_schemas[tool_name] = self._infer_schema(tool_def, tool_name)
+            elif hasattr(tool_def, "execute"):
+                # Build schema from tool's execute method signature
+                # This handles Tool subclass instances (e.g., OpenAppTool, etc.)
+                execute_method = tool_def.execute
+                if callable(execute_method) and hasattr(execute_method, "__doc__"):
+                    self._tool_schemas[tool_name] = self._infer_schema(
+                        execute_method, tool_name
+                    )
+
+    def _extract_kwargs_params_from_docstring(self, docstring: str) -> Dict[str, Dict[str, Any]]:
+        """Extract parameter information from docstring for **kwargs functions.
+
+        Parses docstrings that document kwargs parameters, e.g.:
+        Args:
+            app_name: The application to open
+            target_path: Optional path to launch from
+
+        Returns:
+            Dict mapping param_name to {type, description, required?}
+        """
+        import re
+        params = {}
+        if not docstring:
+            return params
+
+        # Look for Args: section
+        args_match = re.search(r'Args:\s*(.*?)(?=\n\s*(?:Returns:|Raises:|Example:|Note:)|$)',
+                               docstring, re.DOTALL)
+        if not args_match:
+            return params
+
+        args_section = args_match.group(1)
+
+        # Parse each parameter line: "param_name: description" or "param_name (type): description"
+        for line in args_section.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            # Match "param_name:" or "param_name (type):"
+            match = re.match(r'(\w+)(?:\s*\([^)]+\))?:?\s*(.*?)$', line)
+            if match:
+                param_name = match.group(1).strip()
+                description = match.group(2).strip() if match.group(2) else ""
+
+                # Determine if parameter is required based on docstring
+                # Look for keywords like "required", "if not", "missing"
+                # Also assume parameters mentioning "default" are optional
+                is_required = ('required' in description.lower() or 'if not' in description.lower() or 'missing' in description.lower()) and 'default' not in description.lower()
+
+                # Default type is string
+                prop = {
+                    "type": "string",
+                    "description": description,
+                    "_is_required": is_required,
+                }
+                params[param_name] = prop
+
+        return params
 
     def _infer_schema(self, func: Callable, tool_name: str) -> Dict[str, Any]:
         """Infer a tool schema from a callable's signature."""
@@ -160,9 +242,52 @@ Available tools and their schemas:'''
             properties = {}
             required = []
 
+            # Get docstring if available
+            docstring = getattr(func, '__doc__', None) or ""
+
             for param_name, param in sig.parameters.items():
                 if param_name == "self":
                     continue
+                # Handle **kwargs catch-all
+                if param_name == "kwargs" or (
+                    param.kind == inspect.Parameter.VAR_KEYWORD
+                ):
+                    # For **kwargs, try to extract parameter info from docstring
+                    kwargs_params = self._extract_kwargs_params_from_docstring(docstring)
+                    if kwargs_params:
+                        for kw_param, kw_prop in kwargs_params.items():
+                            # Copy the property without internal _is_required field
+                            clean_prop = {
+                                "type": kw_prop.get("type", "string"),
+                                "description": kw_prop.get("description", ""),
+                            }
+                            properties[kw_param] = clean_prop
+
+                            # Check if this parameter is required
+                            if kw_prop.get("_is_required", False):
+                                required.append(kw_param)
+
+                            # Remove the "required" text from description for cleaner schema
+                            desc = kw_prop.get("description", "")
+                            desc = re.sub(r'\s*\(required\)\s*', ' ', desc, flags=re.IGNORECASE)
+                            desc = re.sub(r'If not provided.*$', '', desc, flags=re.IGNORECASE).strip()
+                            properties[kw_param]["description"] = desc
+
+                        # Remove additionalProperties to allow any kwargs
+                        return {
+                            "type": "object",
+                            "properties": properties,
+                            "required": required,
+                            "additionalProperties": True,
+                        }
+
+                    # Fallback: accept any string parameters
+                    properties[param_name] = {
+                        "type": "object",
+                        "description": "Dynamic keyword arguments",
+                    }
+                    continue
+
                 prop = {}
                 if param.annotation != inspect.Parameter.empty:
                     annotation = param.annotation
@@ -371,10 +496,16 @@ Available tools and their schemas:'''
             except json.JSONDecodeError:
                 logger.debug(f"Could not parse plan string: {result[:200] if len(result) > 200 else result}")
 
-        # Validate steps
+        # Validate steps - check if tool exists in registry
         valid_steps = []
         for step in steps:
-            if step.tool_name in self.tool_registry or not self.tool_registry:
+            tool_exists = False
+            if isinstance(self.tool_registry, dict):
+                tool_exists = step.tool_name in self.tool_registry
+            elif hasattr(self.tool_registry, 'get'):
+                tool_exists = self.tool_registry.get(step.tool_name) is not None
+
+            if tool_exists or not self.tool_registry:
                 valid_steps.append(step)
             else:
                 logger.warning(f"Unknown tool '{step.tool_name}' in plan, skipping")
@@ -405,7 +536,17 @@ Available tools and their schemas:'''
                 return False
             if not self._tool_schemas and not self.tool_registry:
                 return False
-            if step.tool_name not in self._tool_schemas and step.tool_name not in self.tool_registry:
+            # Check if tool name is in schemas
+            if step.tool_name not in self._tool_schemas:
+                return False
+            # Check if tool exists in registry (handle both dict and ToolRegistry)
+            if isinstance(self.tool_registry, dict):
+                if step.tool_name not in self.tool_registry:
+                    return False
+            elif hasattr(self.tool_registry, 'get'):
+                if self.tool_registry.get(step.tool_name) is None:
+                    return False
+            else:
                 return False
 
         return True

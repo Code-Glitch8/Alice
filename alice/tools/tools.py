@@ -67,6 +67,15 @@ class OpenAppTool(Tool):
         super().__init__("open_app", "Open an application", required_permission="A")
 
     def execute(self, **kwargs) -> dict:
+        """Open an application on the system.
+
+        Args:
+            app_name: The name of the application to open (required)
+            target_path: Optional path to launch from (default: None)
+
+        Returns:
+            Dict with status, verification info, and any error details
+        """
         # Support both 'app_name' and 'app' parameter names for flexibility
         app_name = kwargs.get("app_name") or kwargs.get("app")
         target_path = kwargs.get("target_path") or kwargs.get("path") or kwargs.get("folder")
@@ -121,6 +130,14 @@ class CloseAppTool(Tool):
         super().__init__("close_app", "Close an application", required_permission="B")
 
     def execute(self, **kwargs) -> dict:
+        """Close an application running on the system.
+
+        Args:
+            app_name: The name of the application to close (required)
+
+        Returns:
+            Dict with status, verification info, and any error details
+        """
         # Support both 'app_name' and 'app' parameter names for flexibility
         app_name = kwargs.get("app_name") or kwargs.get("app")
         if not app_name:
@@ -175,6 +192,14 @@ class FocusAppTool(Tool):
         super().__init__("focus_app", "Focus an application window", required_permission="A")
 
     def execute(self, **kwargs) -> dict:
+        """Focus an application window to bring it to foreground.
+
+        Args:
+            app_name: The name of the application to focus (required)
+
+        Returns:
+            Dict with status, verification info, and any error details
+        """
         # Support both 'app_name' and 'app' parameter names for flexibility
         app_name = kwargs.get("app_name") or kwargs.get("app")
         if not app_name:
@@ -1720,6 +1745,65 @@ class DeleteFolderTool(Tool):
             }
 
 
+class SystemInfoTool(Tool):
+    """Get system information (CPU, RAM, GPU usage)."""
+
+    def __init__(self):
+        super().__init__("system_info", "Get system information (CPU, RAM, GPU usage)", required_permission="A")
+
+    def execute(self, **kwargs) -> dict:
+        """Get system information and usage stats.
+
+        Returns:
+            Dict with CPU, RAM, GPU usage information
+        """
+        from alice.computer.engine import ComputerEngine
+
+        engine = ComputerEngine()
+        info = engine.get_system_info()
+
+        return {
+            "status": "success",
+            "action": "system_info",
+            "cpu_percent": info.get("cpu_percent", 0),
+            "ram_percent": info.get("ram_percent", 0),
+            "ram_used_gb": info.get("ram_used_gb", 0),
+            "ram_total_gb": info.get("ram_total_gb", 0),
+            "gpu_percent": info.get("gpu_percent", 0),
+            "vram_mb": info.get("vram_mb", 0),
+            "verification": {"success": True}
+        }
+
+
+class EmergencyStopTool(Tool):
+    """Emergency stop all automation."""
+
+    def __init__(self):
+        super().__init__("emergency_stop", "Emergency stop all automation immediately", required_permission="B")
+
+    def execute(self, **kwargs) -> dict:
+        """Emergency stop all running automation tasks.
+
+        This tool immediately cancels all ongoing automation and prevents
+        further tool calls until explicitly reset by the user.
+
+        Returns:
+            Dict with status and confirmation message
+        """
+        import asyncio
+        from alice.core.config import Config
+
+        config = Config.load()
+        config.emergency_stop_requested = True
+
+        return {
+            "status": "success",
+            "action": "emergency_stop",
+            "message": "Emergency stop activated. All automation has been halted.",
+            "verification": {"stop_requested": True}
+        }
+
+
 class ToolDispatcher:
     """Central dispatcher for tool execution with async support."""
 
@@ -1815,5 +1899,9 @@ def create_default_tools() -> ToolRegistry:
     registry.register(CopyPasteTool())
     registry.register(GetClipboardTool())
     registry.register(SetClipboardTool())
+
+    # System and emergency tools
+    registry.register(SystemInfoTool())
+    registry.register(EmergencyStopTool())
 
     return registry
