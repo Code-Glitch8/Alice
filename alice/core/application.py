@@ -13,7 +13,10 @@ from typing import Any, Dict, List, Optional
 
 from alice.ai.lmstudio_adapter import LMStudioAdapter, LMStudioError
 from alice.ai.runtime_manager import RuntimeManager
+from alice.ai.context_manager import ContextManager
+from alice.ai.model_capability import create_model_detector
 from alice.tools.tools import create_default_tools, ToolDispatcher, Tool
+from alice.planner.ai_planner import AIPlanner, PlanStep, GeneratedPlan
 from alice.planner.planner import TaskPlanner, TaskStep
 from alice.core.access_manager import ComputerAccessManager
 
@@ -30,11 +33,29 @@ class AliceApplication:
         self.ai_adapter = LMStudioAdapter(config)
         self.runtime = RuntimeManager(self.ai_adapter, config)
 
+        # Model capability detector for adaptive behavior (native vs XML fallback)
+        self.model_detector = create_model_detector(config)
+
+        # Context manager for token budgeting and importance-based summarization
+        self.context_manager = ContextManager(
+            max_context_tokens=int(getattr(config, "context_manager", type("", (), {"max_tokens": 6000})).max_tokens or 6000),
+            reserve_tokens=int(getattr(config, "context_manager", type("", (), {"reserve_tokens": 2192})).reserve_tokens or 2192),
+            system_prompt_tokens=1500,
+            model_name=getattr(config, "context_manager", type("", (), {"model_name": "qwen3.5-4b"})).model_name or "qwen3.5-4b",
+        )
+
         # Tool system with centralized dispatcher
         self.tool_registry = create_default_tools()
         self.task_planner = TaskPlanner(self.tool_registry)
         # Central tool dispatcher - all tool execution goes through this
         self.tool_dispatcher = ToolDispatcher(self.tool_registry, config)
+
+        # AI-driven planner (primary) with legacy fallback
+        self.ai_planner = AIPlanner(
+            tool_registry=self.tool_registry,
+            model_adapter=self.ai_adapter,
+            context_manager=self.context_manager,
+        )
 
         # Permission system. Frontends may supply an explicit Category B
         # confirmation callback; without one, protected actions remain blocked.

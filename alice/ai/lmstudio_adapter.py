@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .adapter import AIProvider
+from .model_capability import create_model_detector, ModelCapabilityDetector
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,9 @@ class LMStudioAdapter(AIProvider):
         self._started_server = False
         self._retry_count = 0
 
+        # Initialize model capability detector for centralized arg normalization
+        self._model_detector = create_model_detector(config)
+
         parsed = urlparse(self.base_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError(f"Invalid LM Studio base URL: {self.base_url}")
@@ -81,6 +85,90 @@ class LMStudioAdapter(AIProvider):
                 max_tokens, context_length, reserved, context_length - reserved, effective_max
             )
         return context_length, effective_max
+
+    def normalize_tool_arguments(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        force_xml: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Centralized tool argument normalization and validation.
+
+        Ensures all tool arguments are properly formatted before dispatch.
+        Handles:
+        - String vs dict argument normalization
+        - Type validation
+        - XML fallback for models that need it
+
+        Args:
+            tool_name: Name of the tool being called
+            arguments: Raw arguments from the model
+            force_xml: Force XML fallback mode even if native is available
+
+        Returns:
+            Normalized and validated arguments dict
+        """
+        # Check if model requires XML fallback
+        if not force_xml and not self._model_detector.requires_xml_fallback():
+            # Native tool calling - validate and ensure dict format
+            normalized = {}
+            for key, value in arguments.items():
+                if isinstance(value, str):
+                    # Try to parse as JSON dict if it looks like one
+                    if value.startswith("{") and value.endswith("}"):
+                        try:
+                            parsed = json.loads(value)
+                            if isinstance(parsed, dict):
+                                normalized[key] = parsed
+                                continue
+                        except json.JSONDecodeError:
+                            pass
+                    normalized[key] = value
+                elif isinstance(value, (int, float, bool)):
+                    normalized[key] = value
+                elif isinstance(value, list):
+                    normalized[key] = value
+                elif isinstance(value, dict):
+                    normalized[key] = value
+                else:
+                    normalized[key] = str(value)
+            return normalized
+        else:
+            # XML fallback mode - ensure all args are strings for XML generation
+            xml_args = {}
+            for key, value in arguments.items():
+                if isinstance(value, str):
+                    xml_args[key] = value
+                elif isinstance(value, (int, float, bool)):
+                    xml_args[key] = str(value)
+                elif isinstance(value, dict):
+                    # Recursively normalize nested dicts
+                    xml_args[key] = self._dict_to_xml_string(value)
+                elif isinstance(value, list):
+                    xml_args[key] = [self._dict_to_xml_string(item) if isinstance(item, dict) else str(item) for item in value]
+                else:
+                    xml_args[key] = str(value)
+            return xml_args
+
+    def _dict_to_xml_string(self, d: Dict[str, Any]) -> str:
+        """Convert a dict to a simple XML string representation."""
+        if not isinstance(d, dict):
+            return str(d)
+        parts = []
+        for key, value in d.items():
+            if isinstance(value, dict):
+                parts.append(f"<{key}>{self._dict_to_xml_string(value)}</{key}>")
+            elif isinstance(value, list):
+                items = "".join(
+                    f"<item>{self._dict_to_xml_string(i) if isinstance(i, dict) else str(i)}</item>"
+                    for i in value
+                )
+                parts.append(f"<{key}>{items}</{key}>")
+            else:
+                parts.append(f"<{key}>{value}</{key}>")
+        return "".join(parts)
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -343,21 +431,29 @@ class LMStudioAdapter(AIProvider):
 
         # Handle tool calls - preserve native format for ALICE's tool execution system
         if tool_calls:
-            # Normalize tool_calls: ensure arguments are JSON strings (OpenAI format)
+            # Normalize tool_calls using centralized argument normalization
             normalized_tool_calls = []
             for tc in tool_calls:
                 if isinstance(tc, dict) and "function" in tc:
                     func = tc.get("function", {})
                     args = func.get("arguments", {})
-                    # Ensure arguments is a JSON string (OpenAI-compatible wire format)
-                    if isinstance(args, dict):
-                        args = json.dumps(args, ensure_ascii=False)
+                    # Use centralized normalization
+                    normalized_args = self.normalize_tool_arguments(
+                        func.get("name", ""),
+                        args if isinstance(args, dict) else {}
+                    )
+                    if isinstance(normalized_args, str):
+                        # If normalization returned a string (XML fallback), use as-is
+                        normalized_args_str = normalized_args
+                    else:
+                        # Otherwise, serialize back to JSON string
+                        normalized_args_str = json.dumps(normalized_args, ensure_ascii=False)
                     normalized_tc = {
                         "id": tc.get("id"),
                         "type": tc.get("type", "function"),
                         "function": {
                             "name": func.get("name"),
-                            "arguments": args
+                            "arguments": normalized_args_str
                         }
                     }
                     normalized_tool_calls.append(normalized_tc)
