@@ -39,7 +39,7 @@ def test_open_notepad_is_routed_to_desktop_app():
 
 
 @pytest.mark.parametrize(
-    "request,folder_name,file_name,location",
+    "user_request,folder_name,file_name,location",
     [
         (
             "create a folder called Homework with a text file named notes.txt inside on my Desktop",
@@ -56,7 +56,7 @@ def test_open_notepad_is_routed_to_desktop_app():
     ],
 )
 def test_compound_folder_and_text_file_plan(
-    request, folder_name, file_name, location, monkeypatch, tmp_path
+    user_request, folder_name, file_name, location, monkeypatch, tmp_path
 ):
     from alice.core import config as config_module
 
@@ -66,7 +66,7 @@ def test_compound_folder_and_text_file_plan(
         lambda requested: tmp_path / requested,
     )
 
-    steps = _planner().plan(request)
+    steps = _planner().plan(user_request)
 
     assert [step.tool_name for step in steps] == ["create_folder", "write_file"]
     created_folder = Path(steps[0].parameters["path"])
