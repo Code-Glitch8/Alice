@@ -11,7 +11,8 @@ from typing import Any
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QLabel,
     QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit, QSplitter,
-    QListWidget, QListWidgetItem, QScrollArea, QFrame
+    QListWidget, QListWidgetItem, QScrollArea, QFrame, QCheckBox,
+    QGroupBox, QFormLayout, QMessageBox
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon
@@ -92,10 +93,55 @@ class Dashboard(QMainWindow):
         system_layout.addWidget(self.vram_label)
         self.tabs.addTab(system_tab, "System Monitor")
 
-        # Settings tab
+        # Settings tab - Computer Access Manager
         settings_tab = QWidget()
         settings_layout = QVBoxLayout(settings_tab)
-        settings_layout.addWidget(QLabel("Settings"))
+        settings_layout.addWidget(QLabel("Computer Access Manager"))
+        settings_layout.addWidget(QLabel(
+            "Choose what ALICE may do. Windows still enforces the permissions of your signed-in account; "
+            "ALICE does not run as Administrator or bypass Windows security."
+        ))
+
+        access_group = QGroupBox("Permissions")
+        access_form = QFormLayout(access_group)
+        access_fields = [
+            ("search_all_drives", "Search all mounted drives"),
+            ("allow_read_files", "Read accessible text files"),
+            ("allow_create_files_folders", "Create files and folders"),
+            ("allow_edit_files", "Edit existing files"),
+            ("allow_move_files", "Move and organize files/folders"),
+            ("allow_app_control", "Control applications and windows"),
+            ("allow_delete_files", "Delete files and folders"),
+        ]
+        self.access_checkboxes = {}
+        for field, label in access_fields:
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(bool(getattr(self.config.automation, field, True)))
+            self.access_checkboxes[field] = checkbox
+            access_form.addRow(checkbox)
+        settings_layout.addWidget(access_group)
+
+        settings_layout.addWidget(QLabel(
+            "Safety rule: ALICE must always ask before overwriting, moving, or deleting. "
+            "The confirmation includes the target path; folder deletion also shows an item count. "
+            "Critical Windows installation folders and drive roots are protected."
+        ))
+        settings_layout.addWidget(QLabel(
+            "Drive discovery (only drives accessible to your current Windows account):"
+        ))
+        try:
+            from alice.core.access_manager import discover_drive_roots
+            drive_text = ", ".join(str(path) for path in discover_drive_roots()) or "No drives discovered"
+        except Exception as exc:
+            drive_text = f"Drive discovery unavailable: {exc}"
+        self.drive_list_label = QLabel(drive_text)
+        self.drive_list_label.setWordWrap(True)
+        settings_layout.addWidget(self.drive_list_label)
+
+        save_access_button = QPushButton("Save Computer Access Settings")
+        save_access_button.clicked.connect(self._save_access_settings)
+        settings_layout.addWidget(save_access_button)
+        settings_layout.addStretch(1)
         self.tabs.addTab(settings_tab, "Settings")
 
         layout.addWidget(self.tabs)
@@ -104,6 +150,22 @@ class Dashboard(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self._update_status)
         self.timer.start(2000)
+
+    def _save_access_settings(self):
+        """Persist Computer Access Manager permissions to the local config."""
+        try:
+            for field, checkbox in self.access_checkboxes.items():
+                setattr(self.config.automation, field, checkbox.isChecked())
+            # This safeguard is intentionally not user-disableable.
+            self.config.automation.require_confirmation_for_destructive = True
+            self.config.save()
+            QMessageBox.information(
+                self, "ALICE Settings Saved",
+                "Computer Access Manager settings were saved. Restart ALICE if it is already running."
+            )
+        except Exception as exc:
+            logger.exception("Could not save Computer Access Manager settings")
+            QMessageBox.critical(self, "Save Failed", f"Could not save settings: {exc}")
 
     def _send_message(self):
         """Send a chat message."""

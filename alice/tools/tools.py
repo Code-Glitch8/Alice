@@ -15,6 +15,7 @@ from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 from alice.core.config import get_windows_known_folder
+from alice.core.access_manager import ComputerAccessManager
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,8 @@ class OpenAppTool(Tool):
                 "message": message,
                 "result": details if success else None,
                 "verification": {
-                    "process_running": success,
+                    "process_running": bool(success and details.get("pid")),
+                    "launch_requested": bool(success),
                     "pid": details.get("pid") if success else None
                 },
                 "error": None if success else message
@@ -345,9 +347,14 @@ class CreateFolderTool(Tool):
             config = Config.load()
             engine = ComputerEngine(config)
 
-            # Resolve the path using Windows known folder API for proper user folder paths
-            # This fixes the issue where Path.resolve() uses CWD-relative instead of actual user folder paths
+            # Resolve and enforce the user's Computer Access Manager settings.
             resolved_path = self._resolve_folder_path(path)
+            access = ComputerAccessManager(config)
+            if not access.permission_enabled("create_folder"):
+                return {"status": "blocked", "action": "create_folder", "error": "Creating files and folders is disabled in ALICE settings."}
+            allowed, reason = access.validate_path(resolved_path)
+            if not allowed:
+                return {"status": "blocked", "action": "create_folder", "error": reason}
 
             success, message = engine.create_folder(str(resolved_path))
 
@@ -434,6 +441,71 @@ class SearchFilesTool(Tool):
                 "verification": {"results_count": 0},
                 "error": str(e)
             }
+
+
+class ReadFileTool(Tool):
+    """Read a bounded UTF-8 text file from an enabled drive."""
+
+    def __init__(self):
+        super().__init__("read_file", "Read a text file", required_permission="A")
+
+    def execute(self, **kwargs) -> dict:
+        path = kwargs.get("path")
+        if not path:
+            return {"status": "error", "action": "read_file", "error": "Missing required parameter: path"}
+        try:
+            from alice.core.config import Config
+            from alice.computer.file_operations import FileOperations
+            config = Config.load()
+            access = ComputerAccessManager(config)
+            if not access.permission_enabled("read_file"):
+                return {"status": "blocked", "action": "read_file", "error": "Reading files is disabled in ALICE settings."}
+            allowed, reason = access.validate_path(path)
+            if not allowed:
+                return {"status": "blocked", "action": "read_file", "error": reason}
+            ok, content, details = FileOperations(config).read_file(path)
+            return {
+                "status": "success" if ok else "error", "action": "read_file",
+                "message": "File read successfully" if ok else content,
+                "result": {"content": content, **details} if ok else details,
+                "error": None if ok else content,
+            }
+        except Exception as exc:
+            logger.exception("ReadFileTool failed")
+            return {"status": "error", "action": "read_file", "error": str(exc)}
+
+
+class MoveFileTool(Tool):
+    """Move or organize a file/folder; dispatcher requires explicit approval."""
+
+    def __init__(self):
+        super().__init__("move_file", "Move or organize a file or folder", required_permission="B")
+
+    def execute(self, **kwargs) -> dict:
+        src = kwargs.get("src") or kwargs.get("source")
+        dst = kwargs.get("dst") or kwargs.get("destination")
+        if not src or not dst:
+            return {"status": "error", "action": "move_file", "error": "Both src and dst are required."}
+        try:
+            from alice.core.config import Config
+            from alice.computer.file_operations import FileOperations
+            config = Config.load()
+            access = ComputerAccessManager(config)
+            if not access.permission_enabled("move_file"):
+                return {"status": "blocked", "action": "move_file", "error": "Moving files is disabled in ALICE settings."}
+            for candidate in (src, dst):
+                allowed, reason = access.validate_path(candidate)
+                if not allowed:
+                    return {"status": "blocked", "action": "move_file", "error": reason}
+            if access.protected_destructive_path(src) or access.protected_destructive_path(dst):
+                return {"status": "blocked", "action": "move_file", "error": "Refusing to move from or into a protected Windows system location."}
+            ok, message, details = FileOperations(config).move_file(src, dst)
+            return {"status": "success" if ok else "error", "action": "move_file",
+                    "message": message, "result": details if ok else None,
+                    "error": None if ok else message}
+        except Exception as exc:
+            logger.exception("MoveFileTool failed")
+            return {"status": "error", "action": "move_file", "error": str(exc)}
 
 
 class BrowserOpenTool(Tool):
@@ -949,6 +1021,30 @@ class CloseAllAppsTool(Tool):
             return {"status": "error", "error": str(e)}
 
 
+class ListInstalledAppsTool(Tool):
+    """List applications discovered on this Windows installation."""
+
+    def __init__(self):
+        super().__init__("list_installed_apps", "List installed applications on this PC", required_permission="A")
+
+    def execute(self, **kwargs) -> dict:
+        try:
+            from alice.computer.engine import ComputerEngine
+            apps = ComputerEngine().list_installed_apps()
+            apps = sorted(apps, key=lambda app: str(app.get("name", "")).casefold())
+            return {
+                "status": "success",
+                "action": "list_installed_apps",
+                "message": f"Found {len(apps)} application entries.",
+                "result": {"apps": apps[:500]},
+                "verification": {"apps_count": len(apps)},
+                "error": None,
+            }
+        except Exception as exc:
+            logger.exception("ListInstalledAppsTool failed")
+            return {"status": "error", "action": "list_installed_apps", "message": str(exc), "error": str(exc)}
+
+ 
 class GetOpenAppsTool(Tool):
     """Get list of applications opened by ALICE."""
 
@@ -1016,6 +1112,7 @@ class TypeTextTool(Tool):
         text = kwargs.get("text", "")
         delay = max(0.0, float(kwargs.get("delay", 0) or 0))
         target_window = kwargs.get("target_window")
+        preserve_focus = bool(kwargs.get("preserve_focus", False))
         if not isinstance(text, str) or not text:
             return {"status": "error", "action": "type_text", "error": "Missing required parameter: text"}
 
@@ -1027,7 +1124,12 @@ class TypeTextTool(Tool):
 
             config = Config.load()
             engine = ComputerEngine(config)
-            if target_window:
+            if preserve_focus:
+                # A preceding planner step already focused the target and may
+                # have created a new document/tab. Do not refocus an older tab.
+                focused = True
+                focus_message = "Preserving the window focused by the preceding plan step"
+            elif target_window:
                 focused, focus_message = engine.focus_app(str(target_window))
             else:
                 focused = engine.auto_focus_most_relevant()
@@ -1044,7 +1146,7 @@ class TypeTextTool(Tool):
                 }
 
             time.sleep(max(0.3, delay))
-            result = set_text_to_clipboard(text, target_window=target_window)
+            result = set_text_to_clipboard(text, target_window=None if preserve_focus else target_window)
             if result.get("status") != "success":
                 return {
                     "status": "error",
@@ -1352,22 +1454,36 @@ class WriteFileTool(Tool):
         try:
             # Load config to get allowed locations
             config = Config.load()
-            allowed_locations = config.automation.allowed_locations
+            access = ComputerAccessManager(config)
+            file_path = Path(path).expanduser()
+            resolved_path = file_path.resolve(strict=False)
+            if not access.path_allowed(resolved_path):
+                return {"status": "blocked", "action": "write_file", "path": str(resolved_path),
+                        "error": f"Path is outside ALICE's enabled computer-access scope: {resolved_path}"}
+            exists = resolved_path.exists()
+            if exists and access.protected_destructive_path(resolved_path):
+                return {"status": "blocked", "action": "write_file", "path": str(resolved_path),
+                        "error": "Refusing to overwrite a protected Windows system file."}
+            permission = "edit_files" if exists else "create_files_folders"
+            setting = "allow_edit_files" if exists else "allow_create_files_folders"
+            if not bool(getattr(config.automation, setting, True)):
+                return {"status": "blocked", "action": "write_file", "path": str(resolved_path),
+                        "error": f"{permission.replace('_', ' ').title()} permission is disabled."}
 
-            # Resolve and validate the path
-            file_path = Path(path)
-            resolved_path = file_path.resolve()
+            # The application layer asks for confirmation before overwriting.
+            # Continue only after that central approval has been granted.
+            allowed_locations = [str(root) for root in access.roots()]
 
             # Check if path is in allowed locations
             if allowed_locations:
                 is_allowed = any(
-                    str(resolved_path).startswith(str(Path(loc).resolve()))
+                    ComputerAccessManager(config).path_allowed(resolved_path)
                     for loc in allowed_locations
                 )
                 if not is_allowed:
                     # Also check if parent directory is in allowed locations
                     parent_allowed = any(
-                        str(resolved_path.parent.resolve()).startswith(str(Path(loc).resolve()))
+                        ComputerAccessManager(config).path_allowed(resolved_path.parent)
                         for loc in allowed_locations
                     )
                     if not parent_allowed:
@@ -1482,25 +1598,16 @@ class DeleteFileTool(Tool):
 
         try:
             config = Config.load()
-            allowed_locations = config.automation.allowed_locations
-
-            file_path = Path(path)
-            resolved_path = file_path.resolve()
-
-            # Check if file is in allowed locations
-            if allowed_locations:
-                is_allowed = any(
-                    str(resolved_path).startswith(str(Path(loc).resolve()))
-                    for loc in allowed_locations
-                )
-                if not is_allowed:
-                    return {
-                        "status": "error",
-                        "action": "delete_file",
-                        "path": str(file_path),
-                        "error": f"Path not in allowed locations: {path}",
-                        "verification": {"file_deleted": False}
-                    }
+            access = ComputerAccessManager(config)
+            file_path = Path(path).expanduser()
+            resolved_path = file_path.resolve(strict=False)
+            if not access.permission_enabled("delete_file"):
+                return {"status": "blocked", "action": "delete_file", "error": "File deletion is disabled in ALICE settings."}
+            allowed, reason = access.validate_path(resolved_path)
+            if not allowed:
+                return {"status": "blocked", "action": "delete_file", "error": reason}
+            if access.protected_destructive_path(resolved_path):
+                return {"status": "blocked", "action": "delete_file", "error": "Refusing to delete a protected Windows system location."}
 
             fo = FileOperations(config)
             success, message, details = fo.delete_file(str(file_path))
@@ -1568,25 +1675,16 @@ class DeleteFolderTool(Tool):
 
         try:
             config = Config.load()
-            allowed_locations = config.automation.allowed_locations
-
-            folder_path = Path(path)
-            resolved_path = folder_path.resolve()
-
-            # Check if folder is in allowed locations
-            if allowed_locations:
-                is_allowed = any(
-                    str(resolved_path).startswith(str(Path(loc).resolve()))
-                    for loc in allowed_locations
-                )
-                if not is_allowed:
-                    return {
-                        "status": "error",
-                        "action": "delete_folder",
-                        "path": str(folder_path),
-                        "error": f"Path not in allowed locations: {path}",
-                        "verification": {"folder_deleted": False}
-                    }
+            access = ComputerAccessManager(config)
+            folder_path = Path(path).expanduser()
+            resolved_path = folder_path.resolve(strict=False)
+            if not access.permission_enabled("delete_folder"):
+                return {"status": "blocked", "action": "delete_folder", "error": "Folder deletion is disabled in ALICE settings."}
+            allowed, reason = access.validate_path(resolved_path)
+            if not allowed:
+                return {"status": "blocked", "action": "delete_folder", "error": reason}
+            if access.protected_destructive_path(resolved_path):
+                return {"status": "blocked", "action": "delete_folder", "error": "Refusing to delete a protected Windows system location."}
 
             fo = FileOperations(config)
             success, message, details = fo.delete_folder(str(folder_path), recursive=recursive)
@@ -1685,10 +1783,13 @@ def create_default_tools() -> ToolRegistry:
     registry.register(OpenAppTool())
     registry.register(CloseAppTool())
     registry.register(FocusAppTool())
+    registry.register(ListInstalledAppsTool())
 
     # File and folder tools
     registry.register(CreateFolderTool())
     registry.register(SearchFilesTool())
+    registry.register(ReadFileTool())
+    registry.register(MoveFileTool())
     registry.register(WriteFileTool())
     registry.register(DeleteFileTool())
     registry.register(DeleteFolderTool())

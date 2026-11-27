@@ -68,37 +68,52 @@ class TaskPlanner:
 
     def plan(self, user_intent: str) -> List[TaskStep]:
         """Break down user intent into ordered, executable steps."""
-        intent_lower = user_intent.lower()
+        import re
+        intent_lower = user_intent.lower().strip()
 
-        # A search command that mentions Chrome is one browser operation:
-        # launching Chrome and passing it the requested search URL. Check this
-        # before the generic open-app branch so the query is not discarded.
-        if "search for " in intent_lower or "search the web for " in intent_lower or "search web for " in intent_lower:
+        # Deterministic system inventory action must be recognized before generic
+        # open/search handling; otherwise small local models can loop on it.
+        if any(phrase in intent_lower for phrase in (
+            "list all the apps", "list all apps", "show installed apps",
+            "list installed applications", "what apps are installed",
+            "all installed programs", "applications on my pc", "apps on my pc",
+        )):
+            steps = [TaskStep(1, "List installed applications", "list_installed_apps", {})]
+        elif "search the web for " in intent_lower or "search web for " in intent_lower:
             steps = self._plan_browser_search(user_intent)
-        elif any(kw in intent_lower for kw in ["download "]):
-            steps = self._plan_browser_download(user_intent)
-        elif any(kw in intent_lower for kw in ["screenshot", "capture "]):
-            steps = self._plan_browser_screenshot(user_intent)
-        elif any(kw in intent_lower for kw in ["extract from ", "summarize ", "read page", "get content"]):
-            steps = self._plan_browser_extract(user_intent)
-        elif any(kw in intent_lower for kw in ["close ", "quit ", "exit "]):
-            steps = self._plan_close_app(user_intent)
-        elif any(kw in intent_lower for kw in ["open", "launch", "start"]) and "chrome" in intent_lower:
-            steps = [TaskStep(
-                1, "Open Google Chrome", "browser_open",
-                {"url": "https://www.google.com/", "visible": True}
-            )]
-        elif any(kw in intent_lower for kw in ["open", "launch", "start"]):
-            steps = self._plan_open_app(user_intent)
-        elif any(kw in intent_lower for kw in ["browser", "search chrome", "search web"]):
-            steps = self._plan_browser_search(user_intent)
-        elif any(kw in intent_lower for kw in ["find", "look for"]):
+        elif (
+            any(phrase in intent_lower for phrase in ("where is ", "locate ", "find ", "look for "))
+            or ("search for " in intent_lower and any(word in intent_lower for word in ("folder", "directory", "file", "path")))
+        ):
             steps = self._plan_search_files(user_intent)
-        elif any(kw in intent_lower for kw in ["create", "make"]):
+        elif "search for " in intent_lower:
+            steps = self._plan_browser_search(user_intent)
+        elif intent_lower.startswith(("move ", "rename ")):
+            steps = self._plan_move_file(user_intent)
+        elif (
+            re.search(r"\b(?:delete|remove)\b.*\b(?:file|folder|directory)\b", intent_lower)
+            or re.search(r"\b(?:delete|remove)\s+(?:the\s+)?[^ ]+\.[a-z0-9]{1,8}\s+from\s+(?:downloads|desktop|documents)\b", intent_lower)
+        ):
+            steps = self._plan_delete_file(user_intent)
+        elif "download " in intent_lower:
+            steps = self._plan_browser_download(user_intent)
+        elif any(kw in intent_lower for kw in ("screenshot", "capture ")):
+            steps = self._plan_browser_screenshot(user_intent)
+        elif any(kw in intent_lower for kw in ("extract from ", "summarize ", "read page", "get content")):
+            steps = self._plan_browser_extract(user_intent)
+        elif any(kw in intent_lower for kw in ("close ", "quit ", "exit ")):
+            steps = self._plan_close_app(user_intent)
+        elif any(kw in intent_lower for kw in ("open", "launch", "start")) and "chrome" in intent_lower:
+            steps = [TaskStep(1, "Open Google Chrome", "browser_open", {"url": "https://www.google.com/", "visible": True})]
+        elif any(kw in intent_lower for kw in ("open", "launch", "start")):
+            steps = self._plan_open_app(user_intent)
+        elif any(kw in intent_lower for kw in ("browser", "search chrome", "search web")):
+            steps = self._plan_browser_search(user_intent)
+        elif any(kw in intent_lower for kw in ("create", "make")):
             steps = self._plan_create(user_intent)
-        elif any(kw in intent_lower for kw in ["extract", "unzip"]):
+        elif any(kw in intent_lower for kw in ("extract", "unzip")):
             steps = self._plan_extract_zip(user_intent)
-        elif any(kw in intent_lower for kw in ["help", "explain"]):
+        elif any(kw in intent_lower for kw in ("help", "explain")):
             steps = self._plan_general_help(user_intent)
         else:
             steps = [TaskStep(1, user_intent, "general", {"intent": user_intent}, requires_confirmation=True)]
@@ -138,24 +153,41 @@ class TaskPlanner:
         app_name = self._extract_app_name(intent)
         steps = [TaskStep(1, f"Open {app_name}", "open_app", {"app_name": app_name})]
 
-        # Accept quoted and plain-language typing/writing requests. Preserve the
-        # whole unquoted phrase until a trailing "save as" clause, when present.
-        text = None
-        write_match = re.search(
-            r"\b(?:type|write|enter)\s+(?:\"([^\"]+)\"|'([^']+)'|(.+?))(?=\s*(?:,?\s*(?:and\s+)?save\s+as\b|$))",
-            intent,
-            flags=re.IGNORECASE | re.DOTALL
+        # Distinguish literal text supplied by the user from a request to
+        # compose content. Never paste the instruction itself as the document.
+        note_match = re.search(
+            r'\b(?:write|create|make)\s+(?:a\s+)?short\s+(?:note|paragraph)\s+(?:on|about)\s+(.+?)(?:[.!?]?$)',
+            intent, flags=re.IGNORECASE
         )
-        if write_match:
-            text = next((part for part in write_match.groups() if part is not None), "").strip()
-            text = text.rstrip(" .!?")
+        write_match = re.search(
+            r'\b(?:type|write|enter)\s+(.+?)(?=\s*(?:,?\s*(?:and\s+)?save\s+as\b|$))',
+            intent, flags=re.IGNORECASE | re.DOTALL
+        )
+        if note_match:
+            topic = note_match.group(1).strip().rstrip(" .!?")
+            steps.append(TaskStep(2, f"Focus {app_name}", "focus_app", {"app_name": app_name}))
+            if "notepad" in app_name.lower():
+                steps.append(TaskStep(3, "Open a new blank Notepad document", "keyboard_shortcut", {"keys": "ctrl+n"}))
+            steps.append(TaskStep(
+                len(steps) + 1, f"Write a short note about {topic}", "type_text",
+                {"generate_topic": topic, "target_window": app_name, "preserve_focus": True}
+            ))
+            text = None
+        elif write_match:
+            supplied = write_match.group(1).strip()
+            if len(supplied) >= 2 and supplied[0] == supplied[-1] and supplied[0] in ('"', "'"):
+                text = supplied[1:-1]
+            elif supplied.lower().startswith("exactly "):
+                text = supplied[8:].strip()
+            else:
+                text = None
             if text:
+                steps.append(TaskStep(2, f"Focus {app_name}", "focus_app", {"app_name": app_name}))
+                if "notepad" in app_name.lower():
+                    steps.append(TaskStep(3, "Open a new blank Notepad document", "keyboard_shortcut", {"keys": "ctrl+n"}))
                 steps.append(TaskStep(
-                    2, f"Focus {app_name}", "focus_app", {"app_name": app_name}
-                ))
-                steps.append(TaskStep(
-                    3, f"Write text in {app_name}", "type_text",
-                    {"text": text, "target_window": app_name}
+                    len(steps) + 1, f"Write supplied text in {app_name}", "type_text",
+                    {"text": text, "target_window": app_name, "preserve_focus": True}
                 ))
 
         save_match = re.search(r"\bsave\s+as\s+([^\s,]+)", intent, flags=re.IGNORECASE)
@@ -227,13 +259,26 @@ class TaskPlanner:
         return steps
 
     def _plan_search_files(self, intent: str) -> List[TaskStep]:
-        """Plan searching for files."""
-        return [
-            TaskStep(
-                1, "Search files",
-                "search_files", {"query": intent}
-            )
-        ]
+        """Extract a filename/folder query and optional known-folder scope."""
+        import re
+        from alice.core.config import get_windows_known_folder
+
+        match = re.search(
+            r"(?:where is|locate|find|look for|search for)\s+(?:the\s+)?(.+?)\s*$",
+            intent, flags=re.IGNORECASE
+        )
+        query = match.group(1).strip() if match else intent.strip()
+        query = re.sub(r"\s+(?:folder|directory|file)$", "", query, flags=re.IGNORECASE).strip()
+        query = query.strip("\"'").strip()
+        folder = None
+        lowered = intent.lower()
+        for label in ("desktop", "documents", "downloads"):
+            if label in lowered:
+                known = get_windows_known_folder(label.title())
+                if known:
+                    folder = str(known)
+                break
+        return [TaskStep(1, f"Search for {query}", "search_files", {"query": query, "folder": folder})]
 
     def _plan_create(self, intent: str) -> List[TaskStep]:
         """Plan creating folders and files."""
@@ -244,7 +289,7 @@ class TaskPlanner:
         # Priority 1: Pattern "create folder/file called X" or "create folder called X anywhere"
         # This handles "Create a folder called Physics Notes on my Desktop"
         name_match = re.search(
-            r'(?:folder|file)\s+(?:called\s+|\'c\s+|\'c[,.]?\s+|\'?\s+)?["\']?((?:[^"\'.,\s]+\s*){1,5})["\']?',
+            r'(?:folder|file)\s+(?:(?:called|named)\s+|\'c\s+|\'c[,.]?\s+|\'?\s+)?["\']?((?:[^"\'.,\s]+\s*){1,5})["\']?',
             intent, re.IGNORECASE
         )
 
@@ -365,6 +410,69 @@ class TaskPlanner:
                     "create_folder", {"path": str(full_path)}
                 )
             ]
+
+    def _resolve_known_location(self, value: str) -> str:
+        """Resolve explicit Desktop/Documents/Downloads prefixes without guessing."""
+        import re
+        from pathlib import Path
+        from alice.core.config import get_windows_known_folder
+
+        value = value.strip().strip('"').strip("'")
+        match = re.match(r"^(desktop|documents|downloads)(?:[\\/](.*))?$", value, re.IGNORECASE)
+        if match:
+            root = get_windows_known_folder(match.group(1).title())
+            if root:
+                return str(root / match.group(2)) if match.group(2) else str(root)
+            return ""
+        return str(Path(value).expanduser())
+
+    def _plan_move_file(self, intent: str) -> List[TaskStep]:
+        """Plan a move/rename only when both source and destination are explicit."""
+        import re
+        match = re.search(r"^\s*(?:move|rename)\s+(?:(?:the|a)\s+)?(?:(?:file|folder|directory)\s+)?(.+?)\s+to\s+(.+?)\s*[.!?]*$", intent, re.IGNORECASE)
+        if not match:
+            return self._plan_general_help(intent)
+        source = self._resolve_known_location(match.group(1))
+        destination = self._resolve_known_location(match.group(2))
+        if not source or not destination:
+            return self._plan_general_help(intent)
+        return [TaskStep(
+            1, f"Move {source} to {destination}", "move_file",
+            {"src": source, "dst": destination}, requires_confirmation=True
+        )]
+
+    def _plan_delete_file(self, intent: str) -> List[TaskStep]:
+        """Plan deletion of an explicitly named file or folder."""
+        import re
+        from pathlib import Path
+        from alice.core.config import get_windows_known_folder
+
+        match = re.search(
+            r"^\s*(?:delete|remove)\s+(?:(?:the|a)\s+)?(?:(file|folder|directory)\s+)?(.+?)\s+(?:from|in)\s+(desktop|documents|downloads)\s*[.!?]*$",
+            intent, re.IGNORECASE
+        )
+        if match:
+            kind, name, location = match.groups()
+            root = get_windows_known_folder(location.title())
+            if not root:
+                return self._plan_general_help(intent)
+            target = str(root / Path(name.strip().strip('"').strip("'")).name)
+        else:
+            match = re.search(
+                r"^\s*(?:delete|remove)\s+(?:(?:the|a)\s+)?(file|folder|directory)\s+(?:named|called)?\s*(.+?)\s*[.!?]*$",
+                intent, re.IGNORECASE
+            )
+            if not match:
+                return self._plan_general_help(intent)
+            kind, name = match.groups()
+            target = self._resolve_known_location(name)
+        if not target:
+            return self._plan_general_help(intent)
+        tool_name = "delete_folder" if kind and kind.lower() in {"folder", "directory"} else "delete_file"
+        return [TaskStep(
+            1, f"Delete {target}", tool_name, {"path": target},
+            requires_confirmation=True
+        )]
 
     def _plan_extract_zip(self, intent: str) -> List[TaskStep]:
         """Plan ZIP extraction."""

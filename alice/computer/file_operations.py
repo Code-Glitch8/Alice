@@ -13,6 +13,8 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
+from alice.core.access_manager import ComputerAccessManager, is_within
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,58 +27,91 @@ class FileOperations:
 
     # Search operations
     def search_files(self, query: str, folder: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Search for files by name or extension within a folder.
+        """Search allowed folders for matching files and directories.
 
-        If no folder is specified, searches across all allowed locations.
+        A supplied folder may be any descendant of an allowed root. Directory
+        names (including hidden folders such as .pytest_cache) are searchable.
         """
-        results = []
-        query_lower = query.lower()
+        query = str(query or "").strip()
+        if not query:
+            return []
+        query_lower = query.casefold()
+        results: List[Dict[str, Any]] = []
 
-        # Determine search locations: specific folder or all allowed locations
-        if folder:
-            search_locations = [Path(folder)]
-        else:
-            search_locations = [Path(loc) for loc in self.allowed_locations if Path(loc).exists()]
-
-        for search_folder in search_locations:
-            # Restrict to allowed locations
-            if str(search_folder) not in self.allowed_locations:
-                logger.warning(f"Search folder {search_folder} not in allowed locations")
-                continue
-
+        def is_within(path: Path, root: Path) -> bool:
             try:
-                if not search_folder.exists():
-                    continue
+                path.resolve().relative_to(root.resolve())
+                return True
+            except (ValueError, OSError):
+                return False
 
-                # If query looks like an extension (starts with .)
-                if query_lower.startswith('.'):
-                    ext = query_lower
-                    for file_path in search_folder.rglob('*'):
-                        if file_path.is_file() and file_path.suffix.lower() == ext:
+        # Roots are discovered from the current configuration. With
+        # search_all_drives enabled this includes every mounted drive that the
+        # current Windows account can access, plus the current project folder.
+        allowed_roots = ComputerAccessManager(self.config).roots()
+
+        if folder:
+            requested = Path(os.path.expandvars(str(folder))).expanduser()
+            try:
+                requested = requested.resolve()
+            except (OSError, RuntimeError):
+                return []
+            if not any(is_within(requested, root) for root in allowed_roots):
+                logger.warning("Search folder %s is outside allowed locations", requested)
+                return []
+            search_roots = [requested]
+        else:
+            search_roots = allowed_roots
+
+        # Dot-prefixed folder names are not file extensions. Extension matching
+        # is only enabled for conventional short suffixes such as .pdf or .txt.
+        extension_query = (
+            query_lower.startswith(".")
+            and len(query_lower) > 1
+            and len(query_lower) <= 12
+            and query_lower[1:].replace("_", "").replace("-", "").isalnum()
+        )
+
+        for root in search_roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            try:
+                for current, dirs, files in os.walk(root, onerror=lambda exc: logger.debug("Search access error: %s", exc)):
+                    # Avoid noisy/system trees while retaining hidden project folders.
+                    dirs[:] = [d for d in dirs if d.casefold() not in {
+                        "node_modules", ".git", "__pycache__", "windows",
+                        "system volume information", "$recycle.bin", "recovery",
+                        "program files", "program files (x86)", "programdata",
+                        "perfLogs".casefold()
+                    }]
+                    current_path = Path(current)
+                    for dirname in dirs:
+                        if query_lower in dirname.casefold():
+                            p = current_path / dirname
                             results.append({
-                                "name": file_path.name,
-                                "path": str(file_path),
-                                "size": file_path.stat().st_size,
-                                "modified": file_path.stat().st_mtime,
+                                "name": dirname, "path": str(p), "type": "directory",
+                                "size": 0, "modified": p.stat().st_mtime
                             })
-                else:
-                    # Search by name pattern
-                    for file_path in search_folder.rglob('*'):
-                        if file_path.is_file() and query_lower in file_path.name.lower():
-                            results.append({
-                                "name": file_path.name,
-                                "path": str(file_path),
-                                "size": file_path.stat().st_size,
-                                "modified": file_path.stat().st_mtime,
-                            })
+                    for filename in files:
+                        p = current_path / filename
+                        try:
+                            matches = p.suffix.casefold() == query_lower if extension_query else query_lower in filename.casefold()
+                            if matches:
+                                results.append({
+                                    "name": filename, "path": str(p), "type": "file",
+                                    "size": p.stat().st_size, "modified": p.stat().st_mtime
+                                })
+                        except (OSError, PermissionError):
+                            continue
+                    if len(results) >= 500:
+                        break
+            except (OSError, PermissionError) as exc:
+                logger.debug("Search failed in %s: %s", root, exc)
+            if len(results) >= 500:
+                break
 
-            except Exception as e:
-                logger.error(f"Search error in {search_folder}: {e}")
-
-        # Sort by modification time, newest first, then by name for consistency
-        results.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
-
-        return results
+        results.sort(key=lambda item: (item.get("modified", 0), item["name"].casefold()), reverse=True)
+        return results[:500]
 
     def find_recent_files(self, folder: Optional[str] = None, days: int = 7) -> List[Dict[str, Any]]:
         """Find recently modified files."""
@@ -173,6 +208,54 @@ class FileOperations:
             return True, f"Moved {src} to {dst}"
         except Exception as e:
             return False, str(e)
+
+    def read_file(self, path: str, max_bytes: int = 32 * 1024) -> Tuple[bool, str, Dict[str, Any]]:
+        """Read a UTF-8 text file within the enabled access scope."""
+        try:
+            from alice.core.access_manager import ComputerAccessManager
+            manager = ComputerAccessManager(self.config)
+            allowed, reason = manager.validate_path(path)
+            if not allowed:
+                return False, reason, {"path": str(path)}
+            file_path = Path(path).expanduser().resolve()
+            if not file_path.exists() or not file_path.is_file():
+                return False, f"File not found: {file_path}", {"path": str(file_path)}
+            size = file_path.stat().st_size
+            if size > max_bytes:
+                return False, f"File is {size} bytes; the read limit is {max_bytes} bytes.", {"path": str(file_path), "size": size}
+            content = file_path.read_text(encoding="utf-8")
+            return True, content, {"path": str(file_path), "size": size}
+        except (UnicodeDecodeError, OSError, PermissionError) as exc:
+            return False, str(exc), {"path": str(path)}
+
+    def move_file(self, src: str, dst: str) -> Tuple[bool, str, Dict[str, Any]]:
+        """Move a file or folder without overwriting an existing destination."""
+        try:
+            from alice.core.access_manager import ComputerAccessManager
+            manager = ComputerAccessManager(self.config)
+            source = Path(src).expanduser().resolve()
+            destination = Path(dst).expanduser().resolve()
+            if not source.exists():
+                return False, f"Source not found: {source}", {"source": str(source)}
+            # A directory destination means "move into this folder", preserving
+            # the source name. An existing file is never overwritten.
+            if destination.exists() and destination.is_dir():
+                destination = destination / source.name
+            for candidate in (source, destination):
+                allowed, reason = manager.validate_path(candidate)
+                if not allowed:
+                    return False, reason, {"source": str(source), "destination": str(destination)}
+            if manager.protected_destructive_path(source) or manager.protected_destructive_path(destination):
+                return False, "Refusing to move from or into a protected system location.", {"source": str(source), "destination": str(destination)}
+            if source.is_dir() and is_within(destination, source):
+                return False, "Cannot move a folder into itself or one of its descendants.", {"source": str(source), "destination": str(destination)}
+            if destination.exists():
+                return False, f"Destination already exists; refusing to overwrite: {destination}", {"destination": str(destination)}
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            return True, f"Moved {source} to {destination}", {"source": str(source), "destination": str(destination)}
+        except (OSError, PermissionError, shutil.Error) as exc:
+            return False, str(exc), {"source": str(src), "destination": str(dst)}
 
     # ZIP operations
     def extract_zip(self, archive_path: str, destination: Optional[str] = None) -> Tuple[bool, str, List[Dict[str, Any]]]:
