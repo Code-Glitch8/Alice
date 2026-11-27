@@ -175,6 +175,33 @@ class TaskPlanner:
         import re
 
         app_name = self._extract_app_name(intent)
+        website_aliases = {
+            "youtube", "yt", "youtube.com", "www.youtube.com",
+            "google", "google.com", "www.google.com",
+            "github", "github.com", "www.github.com",
+            "reddit", "reddit.com", "www.reddit.com",
+            "stackoverflow", "stackoverflow.com",
+            "twitter", "x", "x.com", "instagram", "instagram.com",
+            "facebook", "facebook.com", "linkedin", "linkedin.com",
+            "chatgpt", "chat.openai.com", "openai", "openai.com",
+            "claude", "claude.ai", "lmstudio", "lmstudio.ai",
+        }
+        is_website = (
+            app_name.casefold() in website_aliases
+            or re.fullmatch(
+                r"(?:https?://)?(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:/[^\s]*)?",
+                app_name,
+                flags=re.IGNORECASE,
+            ) is not None
+        )
+        if is_website:
+            return [
+                TaskStep(
+                    1, f"Open {app_name} in Chrome", "browser_open",
+                    {"url": app_name, "visible": True},
+                )
+            ]
+
         steps = [TaskStep(1, f"Open {app_name}", "open_app", {"app_name": app_name})]
 
         # Distinguish literal text supplied by the user from a request to
@@ -308,6 +335,69 @@ class TaskPlanner:
         """Plan creating folders and files."""
         import re
         import os
+
+        # Handle compound requests such as "create a folder called Homework
+        # with a text file inside" as two ordered filesystem actions.
+        compound_folder = re.search(
+            r"\bfolder(?:\s+(?:called|named))?(?:\s+(?P<name>[^,.;]+?))?"
+            r"\s+(?=(?:with|and|containing)\s+(?:a\s+)?(?:plain\s+)?(?:text\s+)?file\b)",
+            intent,
+            flags=re.IGNORECASE,
+        )
+        wants_text_file = bool(
+            re.search(r"\b(?:text\s+)?file\b", intent, flags=re.IGNORECASE)
+            and re.search(r"\b(?:with|and|containing)\b", intent, flags=re.IGNORECASE)
+        )
+        if compound_folder and wants_text_file:
+            from pathlib import Path
+            from alice.core.config import get_windows_known_folder
+
+            folder_name = (compound_folder.group("name") or "").strip().strip('"\'.,;')
+            folder_name = re.sub(
+                r"\s+(?:on|in)\s+(?:my\s+)?(?:desktop|documents|downloads)$",
+                "",
+                folder_name,
+                flags=re.IGNORECASE,
+            ).strip()
+            if not folder_name:
+                folder_name = "NewFolder"
+
+            file_match = re.search(
+                r"\b(?:text\s+)?file\s+(?:called|named)\s+[\"']?([^\"'\s,;.!?]+)",
+                intent,
+                flags=re.IGNORECASE,
+            )
+            file_name = file_match.group(1).strip() if file_match else "notes.txt"
+            if not file_name.lower().endswith(".txt"):
+                file_name += ".txt"
+
+            if re.search(r"\bdocuments\b", intent, flags=re.IGNORECASE):
+                base_folder = get_windows_known_folder("Documents")
+            elif re.search(r"\bdownloads\b", intent, flags=re.IGNORECASE):
+                base_folder = get_windows_known_folder("Downloads")
+            else:
+                base_folder = get_windows_known_folder("Desktop")
+            if base_folder is None:
+                base_folder = Path.home() / "Desktop"
+
+            requested_folder = Path(folder_name).expanduser()
+            folder_path = (
+                requested_folder
+                if requested_folder.is_absolute()
+                else base_folder / requested_folder
+            )
+            file_path = folder_path / file_name
+
+            return [
+                TaskStep(
+                    1, f"Create folder {folder_path.name}",
+                    "create_folder", {"path": str(folder_path)}
+                ),
+                TaskStep(
+                    2, f"Create text file {file_name}",
+                    "write_file", {"path": str(file_path), "content": ""}
+                ),
+            ]
 
         # Extract folder/file name from intent
         # Priority 1: Pattern "create folder/file called X" or "create folder called X anywhere"

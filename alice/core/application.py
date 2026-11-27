@@ -153,6 +153,17 @@ Only call tools when the user explicitly requests a computer action. For normal 
             and any(token in request_lower for token in (".pytest_cache", "folder", "directory", "file"))
         ):
             return await self._execute_planned_tasks(history, original_request, [])
+
+        # Explicit local actions have deterministic handlers. Route them through
+        # the permission-aware planner before calling the model, so small local
+        # models cannot repeatedly issue an already-completed desktop action.
+        if self._is_deterministic_action_request(original_request):
+            planned_steps = self.task_planner.plan(original_request)
+            if planned_steps and all(step.tool_name != "general" for step in planned_steps):
+                return await self._execute_planned_tasks(
+                    history, original_request, [], planned_steps=planned_steps
+                )
+
         max_rounds = max(1, int(getattr(self.automation_config, "max_tool_calls", 5) or 5))
         self.current_tool_call_count = 0
         self.tool_dispatcher.call_count = 0
@@ -217,6 +228,10 @@ Only call tools when the user explicitly requests a computer action. For normal 
                     return await self._execute_planned_tasks(history, user_content, normalized_calls)
 
                 tool_results = await self._execute_tool_calls(normalized_calls, messages, content)
+                terminal_reply = self._terminal_action_reply(normalized_calls, tool_results)
+                if terminal_reply is not None:
+                    return terminal_reply
+
                 messages.append({
                     "role": "assistant",
                     "content": content or "",
@@ -296,10 +311,85 @@ Only call tools when the user explicitly requests a computer action. For normal 
 
         return False
 
-    async def _execute_planned_tasks(self, history: List[Dict[str, str]], content: str, tool_calls: List[Dict]) -> str:
+    def _is_deterministic_action_request(self, request: str) -> bool:
+        """Return True for explicit local actions with reliable deterministic plans."""
+        normalized = " ".join((request or "").casefold().strip().split())
+        if normalized.startswith("please "):
+            normalized = normalized[7:]
+        return normalized.startswith((
+            "open ", "launch ", "start ", "create ", "make ",
+            "close ", "quit ", "exit ", "move ", "rename ",
+            "delete ", "remove ",
+        ))
+
+    def _terminal_action_reply(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        tool_results: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Format a final response after a side-effecting tool has run once.
+
+        Informational tools still go back to the model for summarization. Desktop
+        actions do not: repeating a completed action is unnecessary and can cause
+        small local models to loop until the configured round limit is reached.
+        """
+        terminal_tools = {
+            "open_app", "browser_open", "browser_download", "browser_screenshot",
+            "close_app", "focus_app", "create_folder", "write_file",
+            "move_file", "delete_file", "delete_folder", "type_text",
+            "keyboard_shortcut", "mouse_move", "mouse_click", "mouse_scroll",
+            "select_text", "copy_paste", "set_clipboard", "close_all_apps",
+            "emergency_stop",
+        }
+        names = [
+            ((call.get("function") or {}).get("name") or "")
+            for call in tool_calls if isinstance(call, dict)
+        ]
+        if not names or any(name not in terminal_tools for name in names):
+            return None
+
+        decoded_results = []
+        for item in tool_results:
+            try:
+                decoded = json.loads(item.get("content", "{}"))
+            except (TypeError, json.JSONDecodeError):
+                decoded = {"status": "error", "error": "The tool returned an unreadable result."}
+            decoded_results.append(
+                decoded if isinstance(decoded, dict)
+                else {"status": "error", "error": str(decoded)}
+            )
+
+        if len(decoded_results) != len(names):
+            return "ALICE attempted the desktop action, but could not verify every tool result."
+
+        successful_statuses = {"success", "completed", "navigated", "search_completed"}
+        successes = []
+        failures = []
+        for name, result in zip(names, decoded_results):
+            detail = (
+                result.get("message") or result.get("error")
+                or result.get("url") or result.get("path")
+                or f"{name} finished."
+            )
+            if result.get("status") in successful_statuses:
+                successes.append(str(detail))
+            else:
+                failures.append(f"{name}: {detail}")
+
+        if failures:
+            return "ALICE could not complete the requested action. " + " ".join(failures)
+        return "Done. " + " ".join(successes)
+
+    async def _execute_planned_tasks(
+        self,
+        history: List[Dict[str, str]],
+        content: str,
+        tool_calls: List[Dict],
+        planned_steps: Optional[List[Any]] = None,
+    ) -> str:
         """Execute a deterministic plan through the same permission-aware dispatcher."""
         latest_user = self._get_user_message(history) or content or ""
-        steps = self.task_planner.plan(latest_user)
+        steps = planned_steps if planned_steps is not None else self.task_planner.plan(latest_user)
         if not steps or any(step.tool_name == "general" for step in steps):
             return (
                 "ALICE could not safely map the request to a supported desktop action. "
