@@ -11,11 +11,13 @@ python-dotenv>=1.0.0
 # llama-cpp-python>=0.2.0 (future)
 # Voice Processing
 faster-whisper>=1.0.0
+kokoro-onnx>=0.6.1
+onnxruntime>=1.20.1
 piper-tts>=1.0.0
 pyttsx3>=2.90
 openwakeword>=0.3.0
 sounddevice>=0.4.6
-numpy>=1.26.0
+numpy>=2.0.2,<3
 # Computer Control
 psutil>=5.9.0
 pywinauto>=0.6.8
