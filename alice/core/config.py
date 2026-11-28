@@ -242,6 +242,7 @@ class StartupConfig:
     start_minimized: bool = True
     open_dashboard: bool = False
     background_service: bool = True
+    minimize_to_tray: bool = False
 
 
 @dataclass
