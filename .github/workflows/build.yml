@@ -60,6 +60,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
+      - name: Prepare bundled Silero VAD model
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "build-assets/voice_models" | Out-Null
+          $vadUrl = "https://raw.githubusercontent.com/snakers4/silero-vad/446da2ad95fc90d67a3b12e12ea3f5410b9b3ec4/src/silero_vad/data/silero_vad.onnx"
+          Invoke-WebRequest -Uri $vadUrl -OutFile "build-assets/voice_models/silero_vad.onnx"
+          if ((Get-Item "build-assets/voice_models/silero_vad.onnx").Length -lt 100000) {
+            throw "Silero VAD model download is incomplete."
+          }
       - name: Build ALICE desktop GUI
         shell: pwsh
         run: |
@@ -67,9 +76,15 @@ jobs:
             --collect-all PySide6 `
             --collect-all faster_whisper `
             --collect-all ctranslate2 `
+            --collect-all kokoro_onnx `
+            --collect-all onnxruntime `
+            --collect-all phonemizer `
+            --collect-all espeakng_loader `
             --collect-all pyttsx3 `
             --collect-all sounddevice `
             --collect-all piper `
+            --add-data "build-assets/voice_models/silero_vad.onnx;voice_models" `
+            --hidden-import phonemizer.backend.espeak.wrapper `
             --hidden-import pythoncom `
             --hidden-import win32com.client `
             --hidden-import win32timezone `
