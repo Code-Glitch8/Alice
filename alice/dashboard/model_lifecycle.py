@@ -121,6 +121,7 @@ class ModelLifecycle:
         self.detail: str = ""
         self.loaded_by_alice: bool = False
         self.model_id: Optional[str] = None
+        self._known_unloaded = False
         # Voice pipeline hooks supplied by the UI controller (existing instance).
         self.stop_listening: Optional[Callable[[], None]] = None
         self.stop_speaking: Optional[Callable[[], None]] = None
@@ -197,6 +198,37 @@ class ModelLifecycle:
                 self._set(PowerState.ERROR, str(exc))
                 return False
 
+    def probe(self) -> PowerState:
+        """One read-only check (no loading): reflect what LM Studio reports.
+
+        Used once at dashboard start and once after each request, so the Orb
+        never claims READY for a model that is not loaded (e.g. idle-unloaded).
+        """
+        with self._lock:
+            if self.is_busy:
+                return self.state
+            try:
+                loaded = self._find_loaded()
+            except Exception as exc:  # server down / model not installed
+                logger.info("Model probe: %s", exc)
+                if self.state == PowerState.READY:
+                    self._set(PowerState.OFF, "Model not available")
+                return self.state
+            if loaded is not None:
+                if self._known_unloaded:
+                    self.loaded_by_alice = True  # ALICE's own chat path loaded it
+                self._known_unloaded = False
+                self.model_id = loaded.get("id")
+                if self.state != PowerState.READY:
+                    self._set(PowerState.READY, str(self.model_id or ""))
+            else:
+                self._known_unloaded = True
+                self.loaded_by_alice = False
+                self.model_id = None
+                if self.state != PowerState.OFF:
+                    self._set(PowerState.OFF, "Model not loaded")
+            return self.state
+
     def eject(self, *, explicit: bool = False) -> bool:
         """Unload the model and verify.
 
@@ -219,6 +251,7 @@ class ModelLifecycle:
                 if self._find_loaded() is not None:
                     raise RuntimeError("Model is still loaded after the unload request.")
                 self.loaded_by_alice = False
+                self._known_unloaded = True
                 self.model_id = None
                 self._set(PowerState.OFF, "Model unloaded")
                 return True
