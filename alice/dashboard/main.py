@@ -431,10 +431,7 @@ class Dashboard(QMainWindow):
         menu.addSeparator()
         menu.addAction(exit_action)
         self.tray_icon.setContextMenu(menu)
-        self.tray_icon.activated.connect(
-            lambda reason: self._show_from_tray()
-            if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None
-        )
+        self.tray_icon.activated.connect(lambda _reason: self._show_from_tray())
         self.tray_icon.show()
 
     def _show_from_tray(self) -> None:
