@@ -206,10 +206,40 @@ class Dashboard(QMainWindow):
         self.stt_model_combo = QComboBox()
         self.stt_model_combo.addItems(["tiny", "base", "small", "medium"])
         stt_index = self.stt_model_combo.findText(str(self.config.voice.stt_model))
-        self.stt_model_combo.setCurrentIndex(stt_index if stt_index >= 0 else 1)
+        self.stt_model_combo.setCurrentIndex(stt_index if stt_index >= 0 else 2)
+
+        self.vad_checkbox = QCheckBox("Use Silero VAD to detect speech and trim silence")
+        self.vad_checkbox.setChecked(bool(getattr(self.config.voice, "voice_activity_detection", True)))
+        self.vad_checkbox.setToolTip(
+            "Silero VAD runs locally and sends speech-only chunks to Faster-Whisper. "
+            "If the VAD model cannot load, ALICE falls back to Whisper's built-in VAD."
+        )
+
+        self.tts_language_combo = QComboBox()
+        self.tts_language_combo.addItem("English (US)", "en-us")
+        self.tts_language_combo.addItem("English (UK)", "en-gb")
+        self.tts_language_combo.addItem("Hindi", "hi")
+        language_index = self.tts_language_combo.findData(
+            str(getattr(self.config.voice, "tts_language", "en-us"))
+        )
+        self.tts_language_combo.setCurrentIndex(language_index if language_index >= 0 else 0)
+
+        self.tts_voice_combo = QComboBox()
+        self._refresh_voice_choices()
+        self.tts_language_combo.currentIndexChanged.connect(self._refresh_voice_choices)
+
         self.tts_rate_spin = QSpinBox()
         self.tts_rate_spin.setRange(80, 260)
         self.tts_rate_spin.setValue(int(self.config.voice.tts_rate))
+        self.preview_voice_button = QPushButton("Preview selected voice")
+        self.preview_voice_button.clicked.connect(self._preview_selected_voice)
+        self.voice_model_note = QLabel(
+            "Kokoro neural voices are downloaded locally on first use (about 300 MB). "
+            "Piper is the fallback when a Piper voice pack is installed; Windows SAPI is the final fallback."
+        )
+        self.voice_model_note.setWordWrap(True)
+        self.voice_model_note.setObjectName("muted")
+
         self.wakeword_checkbox.setToolTip(
             "Wake-word monitoring requires a compatible local openWakeWord model. "
             "The OMEN / configured keyboard shortcut can activate manual voice capture."
@@ -220,6 +250,11 @@ class Dashboard(QMainWindow):
         voice_form.addRow("Wake phrase", self.wakeword_edit)
         voice_form.addRow("Microphone", self.mic_device_combo)
         voice_form.addRow("Speech recognition model", self.stt_model_combo)
+        voice_form.addRow(self.vad_checkbox)
+        voice_form.addRow("Spoken language", self.tts_language_combo)
+        voice_form.addRow("Kokoro voice", self.tts_voice_combo)
+        voice_form.addRow(self.preview_voice_button)
+        voice_form.addRow(self.voice_model_note)
         voice_form.addRow("Speech rate", self.tts_rate_spin)
         voice_form.addRow("Voice activation shortcut", self.shortcut_edit)
         settings_layout.addWidget(voice_group)
@@ -281,6 +316,52 @@ class Dashboard(QMainWindow):
             QProgressBar { border: 1px solid #2b374a; border-radius: 6px; text-align: center; background: #171e2b; }
             QProgressBar::chunk { background: #3479c9; border-radius: 5px; }
         """)
+
+    def _refresh_voice_choices(self, *_args) -> None:
+        """Keep Kokoro voice choices compatible with the selected language."""
+        language = str(self.tts_language_combo.currentData() or "en-us")
+        voice_options = {
+            "en-us": [
+                ("Heart — Female", "af_heart"),
+                ("Bella — Female", "af_bella"),
+                ("Nicole — Female", "af_nicole"),
+                ("Sarah — Female", "af_sarah"),
+                ("Michael — Male", "am_michael"),
+                ("Fenrir — Male", "am_fenrir"),
+            ],
+            "en-gb": [
+                ("Emma — Female", "bf_emma"),
+                ("Fable — Male", "bm_fable"),
+            ],
+            "hi": [
+                ("Alpha — Female", "hf_alpha"),
+                ("Beta — Female", "hf_beta"),
+            ],
+        }
+        configured = str(getattr(self.config.voice, "tts_voice", "af_heart") or "af_heart")
+        options = voice_options.get(language, voice_options["en-us"])
+        self.tts_voice_combo.blockSignals(True)
+        self.tts_voice_combo.clear()
+        selected_index = 0
+        for index, (label, voice_id) in enumerate(options):
+            self.tts_voice_combo.addItem(label, voice_id)
+            if voice_id == configured:
+                selected_index = index
+        self.tts_voice_combo.setCurrentIndex(selected_index)
+        self.tts_voice_combo.blockSignals(False)
+
+    def _preview_selected_voice(self) -> None:
+        """Preview the currently selected local Kokoro voice without blocking the UI."""
+        self.config.voice.tts_engine = "kokoro"
+        self.config.voice.tts_language = str(self.tts_language_combo.currentData() or "en-us")
+        self.config.voice.tts_voice = str(self.tts_voice_combo.currentData() or "af_heart")
+        self.config.voice.tts_rate = self.tts_rate_spin.value()
+        threading.Thread(
+            target=self.voice_pipeline.speak,
+            args=("Hello. I am ALICE. This is a preview of the selected neural voice.",),
+            name="ALICE-VoicePreview",
+            daemon=True,
+        ).start()
 
     def _fade_in(self) -> None:
         effect = QGraphicsOpacityEffect(self)
@@ -415,6 +496,10 @@ class Dashboard(QMainWindow):
             self.config.voice.wake_word = self.wakeword_edit.text().strip() or "alice"
             self.config.voice.microphone_device = self.mic_device_combo.currentData()
             self.config.voice.stt_model = self.stt_model_combo.currentText()
+            self.config.voice.voice_activity_detection = self.vad_checkbox.isChecked()
+            self.config.voice.tts_engine = "kokoro"
+            self.config.voice.tts_language = str(self.tts_language_combo.currentData() or "en-us")
+            self.config.voice.tts_voice = str(self.tts_voice_combo.currentData() or "af_heart")
             self.config.voice.tts_rate = self.tts_rate_spin.value()
             self.config.ai.base_url = self.ai_url_edit.text().strip().rstrip("/")
             self.config.ai.model_name = self.model_name_edit.text().strip()
@@ -430,7 +515,8 @@ class Dashboard(QMainWindow):
             self.config.save()
             QMessageBox.information(
                 self, "Settings saved",
-                "Settings were saved. Restart ALICE to apply microphone and hotkey changes."
+                "Settings saved. Restart ALICE to apply microphone and hotkey changes. "
+                "Kokoro voice and Silero VAD settings are ready for the next voice request."
             )
         except Exception as exc:
             logger.exception("Could not save ALICE settings")
