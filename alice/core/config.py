@@ -316,6 +316,14 @@ class Config:
                 for key, value in section_data.items():
                     if hasattr(target, key):
                         setattr(target, key, value)
+        voice_data = data.get("voice")
+        if isinstance(voice_data, dict):
+            # Migrate the previous Piper/SAPI defaults to the new Kokoro-first
+            # stack without replacing a deliberately selected Piper voice.
+            if str(getattr(config.voice, "tts_engine", "kokoro")).lower() == "piper":
+                config.voice.tts_engine = "kokoro"
+            if str(getattr(config.voice, "tts_voice", "")).strip().lower() in {"", "default"}:
+                config.voice.tts_voice = "af_heart"
         if isinstance(data.get("data_dir"), str) and data["data_dir"].strip():
             config.data_dir = data["data_dir"]
         return config
