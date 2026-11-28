@@ -10,8 +10,10 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPropertyAnimation
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QLabel, QVBoxLayout,
     QHBoxLayout, QPushButton, QTextEdit, QListWidget, QCheckBox, QGroupBox,
-    QFormLayout, QMessageBox, QLineEdit, QGraphicsOpacityEffect, QProgressBar
+    QFormLayout, QMessageBox, QLineEdit, QGraphicsOpacityEffect, QProgressBar,
+    QSystemTrayIcon, QMenu, QStyle
 )
+from PySide6.QtGui import QAction
 
 from alice.dashboard.runtime_worker import RuntimeWorker
 from alice.voice.pipeline import VoicePipeline
@@ -50,6 +52,8 @@ class Dashboard(QMainWindow):
         self.resize(1100, 760)
         self.setMinimumSize(820, 600)
         self._setup_ui()
+        self._create_tray()
+        self._really_exit = False
         self._connect_runtime()
         self._fade_in()
 
@@ -186,6 +190,16 @@ class Dashboard(QMainWindow):
         voice_form.addRow(self.wakeword_checkbox)
         voice_form.addRow("Voice activation shortcut", self.shortcut_edit)
         settings_layout.addWidget(voice_group)
+
+        startup_group = QGroupBox("Windows startup and background")
+        startup_form = QFormLayout(startup_group)
+        self.startup_checkbox = QCheckBox("Start ALICE when I sign in")
+        self.startup_checkbox.setChecked(bool(self.config.startup.start_with_windows))
+        self.tray_checkbox = QCheckBox("Keep ALICE running in the system tray when the window is closed")
+        self.tray_checkbox.setChecked(bool(self.config.startup.minimize_to_tray))
+        startup_form.addRow(self.startup_checkbox)
+        startup_form.addRow(self.tray_checkbox)
+        settings_layout.addWidget(startup_group)
 
         self.drive_list_label = QLabel("Drive discovery is available on Windows.")
         self.drive_list_label.setWordWrap(True)
@@ -346,6 +360,10 @@ class Dashboard(QMainWindow):
             self.config.automation.require_confirmation_for_destructive = True
             self.config.voice.mute = self.mute_checkbox.isChecked()
             self.config.voice.wake_word_enabled = self.wakeword_checkbox.isChecked()
+            self.config.startup.start_with_windows = self.startup_checkbox.isChecked()
+            self.config.startup.minimize_to_tray = self.tray_checkbox.isChecked()
+            from alice.core.startup import set_startup_enabled
+            set_startup_enabled(self.startup_checkbox.isChecked())
             shortcut = self.shortcut_edit.text().strip()
             if shortcut:
                 self.config.omen.fallback_shortcut = shortcut
@@ -374,12 +392,62 @@ class Dashboard(QMainWindow):
             except Exception:
                 pass
 
+    def _create_tray(self) -> None:
+        self.tray_icon = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray_icon = QSystemTrayIcon(
+            self.style().standardIcon(QStyle.SP_ComputerIcon), self
+        )
+        self.tray_icon.setToolTip("ALICE — Local desktop assistant")
+        menu = QMenu(self)
+        show_action = QAction("Open ALICE", self)
+        show_action.triggered.connect(self._show_from_tray)
+        voice_action = QAction("Start voice capture", self)
+        voice_action.triggered.connect(self._activate_voice)
+        exit_action = QAction("Exit ALICE", self)
+        exit_action.triggered.connect(self._exit_application)
+        menu.addAction(show_action)
+        menu.addAction(voice_action)
+        menu.addSeparator()
+        menu.addAction(exit_action)
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(
+            lambda reason: self._show_from_tray()
+            if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None
+        )
+        self.tray_icon.show()
+
+    def _show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _exit_application(self) -> None:
+        self._really_exit = True
+        if self.tray_icon:
+            self.tray_icon.hide()
+        self.close()
+        QApplication.quit()
+
     def closeEvent(self, event) -> None:
+        if not self._really_exit and self.config.startup.minimize_to_tray and self.tray_icon:
+            self.hide()
+            self.tray_icon.showMessage(
+                "ALICE is still running",
+                "Use the ALICE tray icon to reopen the dashboard or exit.",
+                QSystemTrayIcon.Information,
+                2500,
+            )
+            event.ignore()
+            return
         if self._voice_recording:
             try:
                 self.voice_pipeline.stop_listening()
             except Exception:
                 pass
+        if self.tray_icon:
+            self.tray_icon.hide()
         if self.runtime_worker and self.runtime_worker.isRunning():
             self.runtime_worker.stop()
         super().closeEvent(event)
