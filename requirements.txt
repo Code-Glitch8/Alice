@@ -12,6 +12,7 @@ python-dotenv>=1.0.0
 # Voice Processing
 faster-whisper>=1.0.0
 piper-tts>=1.0.0
+pyttsx3>=2.90
 openwakeword>=0.3.0
 sounddevice>=0.4.6
 numpy>=1.26.0
