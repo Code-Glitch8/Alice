@@ -3,6 +3,7 @@
 ALICE Hotkey Service - OMEN button and hardware key detection.
 Listens for Windows hardware events and triggers ALICE activation.
 Supports WMI event monitoring with configurable event IDs.
+Integrates with EventBus for IPC communication.
 """
 
 import logging
@@ -17,20 +18,31 @@ logger = logging.getLogger(__name__)
 class HotkeyService:
     """Windows hardware event listener for ALICE activation."""
 
-    def __init__(self, config: Any):
+    def __init__(self, config: Any, event_bus: Any = None):
         self.config = config
+        self.event_bus = event_bus
         self.is_running = False
         self.event_callbacks: List[Callable] = []
         self.last_event_time = 0.0
 
         # OMEN button event signature - configurable via config
-        # Default values (need verification on actual HP Victus 15)
+        # Verified on HP Victus 15: EventID=29, EventData=8613 from hpqBEvnt class
         if config and hasattr(config, 'omen'):
             self.omen_event_id = config.omen.event_id or 29
             self.omen_event_data = config.omen.event_data or 8613
+            self.wmi_namespace = config.omen.wmi_namespace or "root\\wmi"
+            self.debounce_ms = config.omen.debounce_ms or 1000
+            self.suppress_default_launch = getattr(config.omen, 'suppress_default_launch', False)
+            self.diagnostic_mode = getattr(config.omen, 'diagnostic_mode', False)
+            self.fallback_shortcut = getattr(config.omen, 'fallback_shortcut', 'ctrl+alt+a')
         else:
             self.omen_event_id = 29
             self.omen_event_data = 8613
+            self.wmi_namespace = "root\\wmi"
+            self.debounce_ms = 1000
+            self.suppress_default_launch = False
+            self.diagnostic_mode = False
+            self.fallback_shortcut = "ctrl+alt+a"
 
         # WMI monitoring thread
         self._monitor_thread: Optional[threading.Thread] = None
@@ -79,8 +91,9 @@ class HotkeyService:
         """Process a hardware event (thread-safe)."""
         current_time = time.time()
 
-        # Debounce: ignore if same event occurred within 1 second
-        if current_time - self.last_event_time < 1.0:
+        # Debounce: ignore if same event occurred within configured time
+        debounce_seconds = self.debounce_ms / 1000.0
+        if current_time - self.last_event_time < debounce_seconds:
             return
 
         # Check for OMEN key event
@@ -99,11 +112,29 @@ class HotkeyService:
                 except Exception as e:
                     logger.error(f"Callback error: {e}")
 
+            # Publish to EventBus for IPC communication
+            if self.event_bus:
+                try:
+                    self.event_bus.publish("OMEN_KEY_PRESSED", {
+                        "event_id": event_id,
+                        "event_data": event_data,
+                        "source": "wmi",
+                        "timestamp": current_time
+                    })
+                    logger.debug("Published OMEN_KEY_PRESSED to EventBus")
+                except Exception as e:
+                    logger.error(f"EventBus publish error: {e}")
+
         self.last_event_time = current_time
 
     def _wmi_monitor_loop(self) -> None:
         """WMI event monitoring loop (runs in background thread)."""
         logger.info("WMI monitor thread started")
+
+        if self.diagnostic_mode:
+            logger.info(f"[DIAGNOSTIC] OMEN config: event_id={self.omen_event_id}, event_data={self.omen_event_data}, "
+                       f"namespace={self.wmi_namespace}, debounce_ms={self.debounce_ms}, "
+                       f"fallback={self.fallback_shortcut}, suppress_launch={self.suppress_default_launch}")
 
         try:
             import wmi
@@ -111,38 +142,56 @@ class HotkeyService:
 
             pythoncom.CoInitialize()
 
-            # Try HP-specific WMI namespace first
-            namespaces_to_try = [
-                r"root\wmi",
-                r"root\hpq",
-                r"root\cimv2",
-            ]
+            # Use the configured WMI namespace (default: root\wmi)
+            ns = self.wmi_namespace
 
             watcher = None
-            for ns in namespaces_to_try:
-                try:
-                    c = wmi.WMI(namespace=ns)
-                    # Try HP HotKey event class
-                    query = "SELECT * FROM HP_HotKey_Event"
-                    watcher = c.ExecNotificationQuery(query)
-                    logger.info(f"WMI monitoring active on {ns}\\HP_HotKey_Event")
-                    break
-                except Exception as e:
-                    logger.debug(f"Could not monitor {ns}\\HP_HotKey_Event: {e}")
-                    continue
+            try:
+                c = wmi.WMI(namespace=ns)
 
-            # Fallback: broad monitoring
+                # Try the verified HP Victus 15 OMEN button WMI class
+                # User verified: hpqBEvnt with EventID=29, EventData=8613
+                query = (
+                    f"SELECT * FROM hpqBEvnt "
+                    f"WHERE EventID = {self.omen_event_id} AND EventData = {self.omen_event_data}"
+                )
+                watcher = c.ExecNotificationQuery(query)
+                logger.info(
+                    f"WMI monitoring active on {ns}\\hpqBEvnt - "
+                    f"OMEN key detection (EventID={self.omen_event_id}, EventData={self.omen_event_data})"
+                )
+            except Exception as e:
+                logger.debug(f"Could not monitor {ns}\\hpqBEvnt with verified query: {e}")
+
+                # Fallback: try generic HP_HotKey_Event (older HP models)
+                fallback_queries = [
+                    ("HP_HotKey_Event", f"SELECT * FROM HP_HotKey_Event"),
+                    ("HP_WMI", f"SELECT * FROM HP_WMI"),
+                    ("HP_HotKey", f"SELECT * FROM HP_HotKey"),
+                ]
+
+                for class_name, query in fallback_queries:
+                    try:
+                        c = wmi.WMI(namespace=ns)
+                        watcher = c.ExecNotificationQuery(query)
+                        logger.info(f"WMI monitoring active on {ns}\\{class_name} (fallback)")
+                        break
+                    except Exception as fe:
+                        logger.debug(f"Could not monitor {ns}\\{class_name}: {fe}")
+                        continue
+
+            # Fallback: broad monitoring for any WMI event
             if watcher is None:
                 try:
                     c = wmi.WMI(namespace=r"root\wmi")
-                    query = "SELECT * FROM __InstanceCreationEvent"
+                    query = "SELECT * FROM hpqBEvnt"
                     watcher = c.ExecNotificationQuery(query)
-                    logger.info("WMI monitoring active (broad mode on root\\wmi)")
+                    logger.info("WMI monitoring active (broad hpqBEvnt mode on root\\wmi)")
                 except Exception as e:
                     logger.warning(f"Broad WMI monitoring failed: {e}")
 
             if watcher is None:
-                logger.error("Could not establish any WMI monitoring")
+                logger.error("Could not establish any WMI monitoring - OMEN key detection disabled")
                 return
 
             # Event loop
@@ -213,12 +262,12 @@ class HotkeyService:
             self._process_event(event_id, event_data)
 
     def _start_keyboard_listener(self) -> None:
-        """Start fallback keyboard shortcut listener (Ctrl+Alt+A)."""
+        """Start fallback keyboard shortcut listener."""
         try:
             import keyboard
-            # Register hotkey: Ctrl+Alt+A
-            keyboard.add_hotkey('ctrl+alt+a', self._on_keyboard_hotkey)
-            logger.info("Fallback keyboard hotkey registered: Ctrl+Alt+A")
+            # Register hotkey from config (default: ctrl+alt+a)
+            keyboard.add_hotkey(self.fallback_shortcut, self._on_keyboard_hotkey)
+            logger.info(f"Fallback keyboard hotkey registered: {self.fallback_shortcut}")
         except ImportError:
             logger.debug("keyboard module not available - keyboard hotkey disabled")
         except Exception as e:
@@ -243,6 +292,11 @@ class HotkeyService:
             "is_running": self.is_running,
             "event_id": self.omen_event_id,
             "event_data": self.omen_event_data,
+            "wmi_namespace": self.wmi_namespace,
+            "debounce_ms": self.debounce_ms,
+            "fallback_shortcut": self.fallback_shortcut,
+            "suppress_default_launch": self.suppress_default_launch,
+            "diagnostic_mode": self.diagnostic_mode,
             "wmi_monitoring": self._monitor_thread is not None and self._monitor_thread.is_alive(),
             "callbacks_registered": len(self.event_callbacks),
         }

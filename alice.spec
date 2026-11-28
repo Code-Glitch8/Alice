@@ -24,6 +24,10 @@ a = Analysis(
         'psutil',
         'pywinauto',
         'wmi',
+        'pythoncom',  # Required for WMI COM interface in background threads
+        'win32api',
+        'win32con',
+        'win32gui',
         'playwright',
         'rich',
         'click',

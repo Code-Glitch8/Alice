@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 class Orb:
     """Floating Orb UI widget for ALICE."""
 
-    def __init__(self, config: Any):
+    def __init__(self, config: Any, event_bus: Any = None):
         self.config = config
+        self.event_bus = event_bus
         self.state: str = "idle"  # idle, listening, thinking, speaking, executing, waiting, error
         self.is_visible: bool = True
         self.position_x: int = 100
@@ -26,6 +27,17 @@ class Orb:
         self.current_text: str = ""
         self.waveform_visible: bool = False
         self.task_progress: float = 0.0
+
+        # Subscribe to OMEN key events if event_bus provided
+        if self.event_bus:
+            self.event_bus.subscribe("OMEN_KEY_PRESSED", self._on_omen_key_pressed)
+            logger.info("Orb subscribed to OMEN_KEY_PRESSED events")
+
+    def _on_omen_key_pressed(self, event_data: Dict[str, Any]) -> None:
+        """Handle OMEN key press - activate listening state."""
+        logger.info(f"Orb received OMEN key event: {event_data}")
+        self.update_state("listening")
+        self.show_waveform()
 
     def update_state(self, new_state: str) -> None:
         """Update orb state with smooth transition."""

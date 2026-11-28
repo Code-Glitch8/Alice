@@ -227,8 +227,10 @@ class OrbConfig:
 @dataclass
 class OmenConfig:
     enabled: bool = True
-    event_id: Optional[int] = None
-    event_data: Optional[int] = None
+    event_id: Optional[int] = 29  # Verified HP Victus 15 OMEN button EventID
+    event_data: Optional[int] = 8613  # Verified HP Victus 15 OMEN button EventData
+    wmi_namespace: str = "root\\wmi"
+    debounce_ms: int = 1000  # Debounce time in milliseconds
     suppress_default_launch: bool = False
     fallback_shortcut: str = "ctrl+alt+a"
     diagnostic_mode: bool = False

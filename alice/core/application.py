@@ -19,6 +19,8 @@ from alice.tools.tools import create_default_tools, ToolDispatcher, Tool
 from alice.planner.ai_planner import AIPlanner, PlanStep, GeneratedPlan
 from alice.planner.planner import TaskPlanner, TaskStep
 from alice.core.access_manager import ComputerAccessManager
+from alice.core.events import EventBus
+from alice.omen.hotkey_service import HotkeyService
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,15 @@ class AliceApplication:
             model_adapter=self.ai_adapter,
             context_manager=self.context_manager,
         )
+
+        # Event bus for IPC communication (OMEN key, etc.)
+        self.event_bus = EventBus()
+
+        # OMEN Hotkey Service - hardware key detection
+        self.hotkey_service = HotkeyService(config, self.event_bus)
+
+        # Orb - floating UI widget
+        self.orb = None
 
         # Permission system. Frontends may supply an explicit Category B
         # confirmation callback; without one, protected actions remain blocked.
@@ -114,7 +125,30 @@ Only call tools when the user explicitly requests a computer action. For normal 
         ok = await self.runtime.start()
         self.initialized = bool(ok)
         self.running = bool(ok)
+
+        # Create Orb if enabled
+        if self.config.orb.enabled:
+            self.create_orb()
+            logger.info("Orb created and subscribed to EventBus")
+
+        # Start OMEN hotkey service if enabled
+        if self.config.omen.enabled:
+            await self.hotkey_service.start()
+            # Subscribe to OMEN key events
+            self.event_bus.subscribe("OMEN_KEY_PRESSED", self._on_omen_key_pressed)
+            logger.info("OMEN hotkey service started and subscribed to EventBus")
+
         return bool(ok)
+
+    def _on_omen_key_pressed(self, event_data: Dict[str, Any]) -> None:
+        """Handle OMEN key press event from EventBus."""
+        logger.info(f"OMEN key pressed - activating ALICE: {event_data}")
+        # Update orb state if available
+        if self.orb:
+            self.orb.update_state("listening")
+            self.orb.show_waveform()
+        # This can trigger orb state change, dashboard notification, etc.
+        # Frontend components can also subscribe to this event
 
     async def ask(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         """Send one prompt to the configured local model."""
@@ -1226,19 +1260,40 @@ Only call tools when the user explicitly requests a computer action. For normal 
         return {"plan": self.task_planner.get_plan_summary(), "steps": results}
 
     async def shutdown_async(self) -> None:
+        # Stop OMEN hotkey service
+        if hasattr(self, 'hotkey_service') and self.hotkey_service:
+            await self.hotkey_service.stop()
+            logger.info("OMEN hotkey service stopped")
+
         if self.initialized:
             await self.runtime.stop()
         self.initialized = False
         self.running = False
 
     def get_status(self) -> Dict[str, Any]:
-        return {
+        status = {
             "initialized": self.initialized,
             "running": self.running,
             "ai": self.runtime.get_status(),
             "tools": [t.name for t in self.tool_registry.list_tools()],
             "computer_access": ComputerAccessManager(self.config).status(),
         }
+
+        # Add hotkey service status if available
+        if hasattr(self, 'hotkey_service') and self.hotkey_service:
+            status["hotkey_service"] = self.hotkey_service.get_status()
+
+        # Add orb status if available
+        if hasattr(self, 'orb') and self.orb:
+            status["orb"] = self.orb.get_status()
+
+        return status
+
+    def create_orb(self) -> Any:
+        """Create and initialize the Orb with event bus subscription."""
+        from alice.orb.orb import Orb
+        self.orb = Orb(self.config, self.event_bus)
+        return self.orb
 
     def run(self) -> None:
         """Start the local runtime service; GUI wiring is a later integration phase."""

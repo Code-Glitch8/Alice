@@ -1,0 +1,22 @@
+{
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.82.0",
+    "motion": "^14.14.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tailwind-merge": "^3.7.1",
+    "three": "^0.187.0",
+    "zod": "^4.6.7",
+    "zustand": "^5.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.3.0",
+    "concurrently": "^10.0.7",
+    "electron": "^45.5.0",
+    "electron-builder": "^26.18.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.4.0",
+    "wait-on": "^9.5.1"
+  }
+}

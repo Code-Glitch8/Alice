@@ -184,9 +184,13 @@ class Dashboard(QMainWindow):
             self.status_label.setText(f"Status: {status['state']}")
 
 
-def run_dashboard(config: Any, orb: Any):
+def run_dashboard(config: Any, orb: Any, event_bus: Any = None):
     """Run the dashboard application."""
     app = QApplication(sys.argv)
+    # If orb wasn't created with event_bus, subscribe it now
+    if event_bus and orb.event_bus is None:
+        orb.event_bus = event_bus
+        event_bus.subscribe("OMEN_KEY_PRESSED", orb._on_omen_key_pressed)
     dashboard = Dashboard(config, orb)
     dashboard.show()
     sys.exit(app.exec())
@@ -195,9 +199,11 @@ def run_dashboard(config: Any, orb: Any):
 if __name__ == "__main__":
     from alice.core.config import Config
     from alice.orb.orb import Orb
+    from alice.core.events import EventBus
     app = QApplication(sys.argv)
     config = Config.load()
-    orb = Orb(config)
+    event_bus = EventBus()
+    orb = Orb(config, event_bus)
     dashboard = Dashboard(config, orb)
     dashboard.show()
     sys.exit(app.exec())
