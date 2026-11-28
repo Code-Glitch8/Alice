@@ -1,88 +1,180 @@
 #!/usr/bin/env python3
-"""
-Wake word detection for ALICE.
-Uses OpenWakeWord or similar offline engine.
-"""
+"""Offline wake-phrase detector.
 
-import logging
+This uses the bundled Faster-Whisper dependency with a small local model. It is
+less power-efficient than a purpose-trained wake-word model, but it supports a
+user-configured phrase such as "alice" without a cloud service or training step.
+"""
+from __future__ import annotations
+
 import asyncio
-from typing import Any, Optional, Callable, Dict
+import logging
+import queue
+import re
+import threading
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class WakeWordDetector:
-    """Lightweight offline wake word detector."""
+    """Listen locally for a configured phrase and invoke a callback once detected."""
 
     def __init__(self, config: Any):
         self.config = config
-        self.listening: bool = False
-        self.wake_word: str = config.voice.wake_word
-        self._callback: Optional[Callable] = None
-        self._monitor_task: Optional[asyncio.Task] = None
-
-    async def start(self) -> bool:
-        """Start wake word detection."""
-        if self.listening:
-            return True
-
-        logger.info(f"Starting wake word detection: {self.wake_word}")
-        self.listening = True
-
-        # In production, initialize OpenWakeWord here
-        # For now, simulate
-        self._monitor_task = asyncio.create_task(self._monitor_loop())
-
-        return True
-
-    async def stop(self) -> bool:
-        """Stop wake word detection."""
         self.listening = False
-
-        if self._monitor_task:
-            self._monitor_task.cancel()
-            self._monitor_task = None
-
-        logger.info("Wake word detection stopped")
-        return True
+        self.wake_word = str(getattr(config.voice, "wake_word", "alice") or "alice")
+        self._callback: Optional[Callable] = None
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._audio_queue: queue.Queue = queue.Queue(maxsize=80)
+        self._model = None
+        self._model_lock = threading.Lock()
+        self.last_error: str | None = None
+        self._stream = None
 
     def set_callback(self, callback: Callable) -> None:
-        """Set the wake word detected callback."""
         self._callback = callback
 
-    async def _monitor_loop(self) -> None:
-        """Main monitoring loop (placeholder)."""
-        while self.listening:
-            # In production, this would process audio buffer
-            # and detect wake word
-            await asyncio.sleep(0.1)  # Polling interval
+    def _get_model(self):
+        with self._model_lock:
+            if self._model is None:
+                from faster_whisper import WhisperModel
+                model_dir = Path(self.config.data_dir).expanduser() / "voice" / "models"
+                model_dir.mkdir(parents=True, exist_ok=True)
+                self._model = WhisperModel(
+                    "tiny.en",
+                    device="cpu",
+                    compute_type="int8",
+                    download_root=str(model_dir),
+                    cpu_threads=2,
+                )
+            return self._model
+
+    @staticmethod
+    def _contains_phrase(transcript: str, phrase: str) -> bool:
+        words = re.findall(r"[a-z0-9]+", transcript.casefold())
+        target = re.findall(r"[a-z0-9]+", phrase.casefold())
+        if not target:
+            return False
+        width = len(target)
+        return any(words[index:index + width] == target for index in range(len(words) - width + 1))
+
+    def start(self) -> bool:
+        if self.listening:
+            return True
+        try:
+            import sounddevice as sd  # Verify audio support before starting.
+            del sd
+        except ImportError as exc:
+            self.last_error = "sounddevice is not installed."
+            raise RuntimeError(self.last_error) from exc
+
+        self._stop_event.clear()
+        self.last_error = None
+        self.listening = True
+        self._thread = threading.Thread(
+            target=self._monitor_loop, name="ALICE-WakeWord", daemon=True
+        )
+        self._thread.start()
+        return True
+
+    async def start_async(self) -> bool:
+        return self.start()
+
+    def stop(self) -> bool:
+        self._stop_event.set()
+        self.listening = False
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=4)
+        self._thread = None
+        return True
+
+    async def stop_async(self) -> bool:
+        return await asyncio.to_thread(self.stop)
+
+    def _audio_callback(self, indata, frames, time_info, status) -> None:
+        if status:
+            logger.debug("Wake-word microphone status: %s", status)
+        try:
+            self._audio_queue.put_nowait(indata.copy())
+        except queue.Full:
+            try:
+                self._audio_queue.get_nowait()
+                self._audio_queue.put_nowait(indata.copy())
+            except queue.Empty:
+                pass
+
+    def _transcribe_chunk(self, audio) -> str:
+        model = self._get_model()
+        segments, _info = model.transcribe(
+            audio,
+            language="en",
+            beam_size=1,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+        return " ".join(segment.text.strip() for segment in segments).strip()
+
+    def _monitor_loop(self) -> None:
+        import numpy as np
+        import sounddevice as sd
+
+        frames = []
+        try:
+            with sd.InputStream(
+                device=self.config.voice.microphone_device,
+                samplerate=16000,
+                channels=1,
+                dtype="float32",
+                blocksize=1280,
+                callback=self._audio_callback,
+            ) as stream:
+                self._stream = stream
+                while not self._stop_event.is_set():
+                    try:
+                        frames.append(self._audio_queue.get(timeout=0.5))
+                    except queue.Empty:
+                        continue
+                    # 32 x 80 ms = about 2.56 seconds, with a short overlap.
+                    if len(frames) < 32:
+                        continue
+                    audio = np.concatenate(frames, axis=0).reshape(-1)
+                    frames = frames[-12:]
+                    if float(np.max(np.abs(audio))) < 0.004:
+                        continue
+                    transcript = self._transcribe_chunk(audio)
+                    if self._contains_phrase(transcript, self.wake_word):
+                        logger.info("ALICE wake phrase detected")
+                        self._stop_event.set()
+                        self.listening = False
+                        callback = self._callback
+                        if callback:
+                            callback()
+                        break
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.listening = False
+            logger.exception("Wake-word monitor stopped")
+        finally:
+            self._stream = None
+            self.listening = False
 
     def detect_wake_word(self, audio_data: Any) -> bool:
-        """Check if wake word is detected in audio data."""
-        # Placeholder - in production uses OpenWakeWord
-        return False
+        """Transcribe a supplied audio array and check for the configured phrase."""
+        try:
+            transcript = self._transcribe_chunk(audio_data)
+            return self._contains_phrase(transcript, self.wake_word)
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.exception("Could not evaluate wake phrase")
+            return False
 
-    def get_status(self) -> Dict[str, Any]:
-        """Get detector status."""
+    def get_status(self) -> dict[str, Any]:
         return {
             "listening": self.listening,
             "wake_word": self.wake_word,
+            "last_error": self.last_error,
         }
-
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, '.')
-    from alice.core.config import Config
-
-    config = Config.load()
-    detector = WakeWordDetector(config)
-
-    async def test():
-        await detector.start()
-        status = detector.get_status()
-        print(f"Wake word status: {status}")
-        await detector.stop()
-
-    import asyncio
-    asyncio.run(test())
