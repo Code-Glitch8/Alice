@@ -79,10 +79,14 @@ class RuntimeWorker(QThread):
         self.history.append({"role": "user", "content": message})
         try:
             if not self.runtime.initialized:
-                if not await self.runtime.initialize():
+                # initialize() already starts the hotkey/orb services on first launch.
+                # Retry only the LM Studio runtime here to avoid registering duplicate hooks.
+                if not await self.runtime.runtime.start():
                     raise RuntimeError(
                         self.runtime.ai_adapter.last_error or "Could not connect to LM Studio."
                     )
+                self.runtime.initialized = True
+                self.runtime.running = True
             # load_model is idempotent when the configured model is already loaded.
             if not await self.runtime.runtime.load_model():
                 raise RuntimeError(
