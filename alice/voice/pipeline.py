@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Offline-capable microphone capture and speech recognition for ALICE.
+"""Offline-capable microphone capture, Silero VAD and Faster-Whisper STT.
 
-Audio is held in memory only. No recording is written to disk.
+Audio is held in memory only. No microphone recording is written to disk.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
-import asyncio
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class VoicePipeline:
-    """Capture microphone audio and transcribe it locally with faster-whisper."""
+    """Capture microphone audio and transcribe it locally with Faster-Whisper."""
 
     SAMPLE_RATE = 16000
 
@@ -30,7 +30,8 @@ class VoicePipeline:
         self._audio_lock = threading.Lock()
         self._model = None
         self._model_lock = threading.Lock()
-        self._tts_engine = None
+        self._vad = None
+        self._vad_lock = threading.Lock()
         self._tts = None
         self._tts_lock = threading.Lock()
         self.last_error: Optional[str] = None
@@ -75,7 +76,7 @@ class VoicePipeline:
             raise RuntimeError(f"Could not open microphone: {exc}") from exc
 
     def stop_listening(self) -> bool:
-        """Stop microphone capture and retain the in-memory audio for transcription."""
+        """Stop capture and retain the in-memory audio for transcription."""
         stream, self._stream = self._stream, None
         self.listening = False
         if stream is not None:
@@ -97,8 +98,9 @@ class VoicePipeline:
                     ) from exc
                 voice_dir = Path(self.config.data_dir).expanduser() / "voice" / "models"
                 voice_dir.mkdir(parents=True, exist_ok=True)
-                model_name = str(getattr(self.config.voice, "stt_model", "base") or "base")
-                # CPU INT8 is the most compatible mode for packaged Windows builds.
+                model_name = str(getattr(self.config.voice, "stt_model", "small") or "small")
+                # CPU INT8 is reliable in packaged Windows builds and avoids
+                # competing with LM Studio for the laptop's 4 GB of VRAM.
                 self._model = WhisperModel(
                     model_name,
                     device="cpu",
@@ -108,8 +110,29 @@ class VoicePipeline:
                 )
             return self._model
 
+    def _get_vad(self):
+        with self._vad_lock:
+            if self._vad is None:
+                from alice.voice.vad import SileroVAD
+                self._vad = SileroVAD(self.config)
+            return self._vad
+
+    @staticmethod
+    def _transcribe_chunk(model, audio, *, use_builtin_vad: bool = False) -> str:
+        segments, _info = model.transcribe(
+            audio,
+            beam_size=3,
+            vad_filter=use_builtin_vad,
+            condition_on_previous_text=False,
+        )
+        return " ".join(
+            segment.text.strip()
+            for segment in segments
+            if getattr(segment, "text", "").strip()
+        ).strip()
+
     def recognize(self) -> str:
-        """Transcribe the last recording using the local Faster-Whisper model."""
+        """Transcribe the last recording, applying Silero VAD before Whisper."""
         if self.listening:
             raise RuntimeError("Stop the microphone recording before transcribing.")
         import numpy as np
@@ -126,18 +149,39 @@ class VoicePipeline:
             return ""
 
         model = self._get_model()
-        segments, _info = model.transcribe(
-            audio,
-            beam_size=1,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-        transcript = " ".join(segment.text.strip() for segment in segments).strip()
+        if bool(getattr(self.config.voice, "voice_activity_detection", True)):
+            try:
+                speech_chunks = self._get_vad().split_audio(audio)
+                if not speech_chunks:
+                    logger.info("Silero VAD found no speech in the recording")
+                    return ""
+                transcripts = [
+                    self._transcribe_chunk(model, chunk, use_builtin_vad=False)
+                    for chunk in speech_chunks
+                    if chunk.size >= int(self.SAMPLE_RATE * 0.25)
+                ]
+                transcript = " ".join(part for part in transcripts if part).strip()
+                logger.info(
+                    "Speech recognition completed with Silero VAD (%d chunks, %d characters)",
+                    len(speech_chunks),
+                    len(transcript),
+                )
+                return transcript
+            except Exception as exc:
+                # VAD is optional at runtime: an unavailable download or ONNX
+                # runtime falls back to Faster-Whisper's built-in VAD.
+                logger.warning(
+                    "Silero VAD failed; using Faster-Whisper built-in VAD: %s", exc,
+                    exc_info=True,
+                )
+                self.last_error = f"Silero VAD unavailable; using Whisper VAD: {exc}"
+
+        transcript = self._transcribe_chunk(model, audio, use_builtin_vad=True)
         logger.info("Speech recognition completed (%d characters)", len(transcript))
         return transcript
 
     def speak(self, text: str) -> None:
-        """Speak locally with Piper when configured, otherwise Windows SAPI."""
+        """Speak locally with Kokoro; fall back to Piper, then Windows SAPI."""
         text = str(text or "").strip()
         if not text:
             return
@@ -147,9 +191,9 @@ class VoicePipeline:
                 return
             self.speaking = True
         try:
-            from alice.voice.tts import PiperTTS
+            from alice.voice.tts import LocalTTS
             if self._tts is None:
-                self._tts = PiperTTS(self.config)
+                self._tts = LocalTTS(self.config)
             asyncio.run(self._tts.speak(text))
         except Exception as exc:
             self.last_error = str(exc)
@@ -181,4 +225,6 @@ class VoicePipeline:
             "wake_word_active": self.wake_word_active,
             "last_error": self.last_error,
             "buffered_audio": bool(self._frames),
+            "vad": "silero" if bool(getattr(self.config.voice, "voice_activity_detection", True)) else "whisper",
+            "tts_engine": getattr(self._tts, "engine", "kokoro (lazy)"),
         }
