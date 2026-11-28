@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import asyncio
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -30,6 +31,7 @@ class VoicePipeline:
         self._model = None
         self._model_lock = threading.Lock()
         self._tts_engine = None
+        self._tts = None
         self._tts_lock = threading.Lock()
         self.last_error: Optional[str] = None
 
@@ -135,40 +137,29 @@ class VoicePipeline:
         return transcript
 
     def speak(self, text: str) -> None:
-        """Speak text locally using Windows SAPI through pyttsx3."""
+        """Speak locally with Piper when configured, otherwise Windows SAPI."""
         text = str(text or "").strip()
         if not text:
             return
         with self._tts_lock:
             if self.speaking:
-                logger.debug("TTS request ignored because ALICE is already speaking")
+                logger.debug("Ignoring overlapping speech request")
                 return
             self.speaking = True
-            try:
-                try:
-                    import pyttsx3
-                except ImportError as exc:
-                    raise RuntimeError("Offline speech output is not installed.") from exc
-                if self._tts_engine is None:
-                    self._tts_engine = pyttsx3.init()
-                    self._tts_engine.setProperty(
-                        "rate", int(getattr(self.config.voice, "tts_rate", 150))
-                    )
-                self._tts_engine.say(text)
-                self._tts_engine.runAndWait()
-            except Exception as exc:
-                self.last_error = str(exc)
-                logger.exception("Text-to-speech failed")
-            finally:
-                self.speaking = False
+        try:
+            from alice.voice.tts import PiperTTS
+            if self._tts is None:
+                self._tts = PiperTTS(self.config)
+            asyncio.run(self._tts.speak(text))
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.exception("Text-to-speech failed")
+        finally:
+            self.speaking = False
 
     def stop_speaking(self) -> None:
-        engine = self._tts_engine
-        if engine is not None:
-            try:
-                engine.stop()
-            except Exception:
-                logger.debug("Could not stop speech engine", exc_info=True)
+        if self._tts is not None:
+            self._tts.stop()
         self.speaking = False
 
     def set_wake_word(self, wake_word: str) -> bool:
