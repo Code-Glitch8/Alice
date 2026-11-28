@@ -21,6 +21,7 @@ class RuntimeWorker(QThread):
     error = Signal(str)
     state_changed = Signal(str)
     hotkey_activated = Signal()
+    wake_word_paused = Signal()
     confirmation_requested = Signal(str, object)
 
     def __init__(self, config: Any, parent=None):
@@ -30,6 +31,11 @@ class RuntimeWorker(QThread):
         self.runtime: AliceApplication | None = None
         self.history: list[dict[str, str]] = []
         self._stopping = False
+        self.wake_detector = None
+        self.wake_word_enabled = bool(
+            getattr(config.voice, "wake_word_enabled", False)
+            and not getattr(config.voice, "mute", False)
+        )
 
     def run(self) -> None:
         self.loop = asyncio.new_event_loop()
@@ -53,8 +59,22 @@ class RuntimeWorker(QThread):
                 self.ready.emit(False, str(exc))
                 self.state_changed.emit("Offline")
 
+            if self.wake_word_enabled:
+                try:
+                    from alice.voice.wake_word import WakeWordDetector
+                    self.wake_detector = WakeWordDetector(self.config)
+                    self.wake_detector.set_callback(self._on_wake_word_detected)
+                    self.wake_detector.start()
+                except Exception as exc:
+                    self.error.emit(f"Wake-word monitor could not start: {exc}")
+
             self.loop.run_forever()
         finally:
+            if self.wake_detector is not None:
+                try:
+                    self.loop.run_until_complete(self.wake_detector.stop_async())
+                except Exception as exc:
+                    self.error.emit(f"Wake-word shutdown warning: {exc}")
             if self.runtime is not None:
                 try:
                     self.loop.run_until_complete(self.runtime.shutdown_async())
@@ -103,6 +123,33 @@ class RuntimeWorker(QThread):
             self.history.pop()
             self.error.emit(str(exc))
             self.state_changed.emit("Error")
+
+    def _on_wake_word_detected(self) -> None:
+        self.hotkey_activated.emit()
+
+    def pause_wake_word(self) -> None:
+        if not self.loop or not self.loop.is_running():
+            self.wake_word_paused.emit()
+            return
+        asyncio.run_coroutine_threadsafe(self._pause_wake_word(), self.loop)
+
+    async def _pause_wake_word(self) -> None:
+        if self.wake_detector is not None:
+            await self.wake_detector.stop_async()
+        self.wake_word_paused.emit()
+
+    def resume_wake_word(self) -> None:
+        if not self.wake_word_enabled or self._stopping:
+            return
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._resume_wake_word(), self.loop)
+
+    async def _resume_wake_word(self) -> None:
+        if self.wake_detector is not None and not self.wake_detector.listening:
+            try:
+                await self.wake_detector.start_async()
+            except Exception as exc:
+                self.error.emit(f"Wake-word monitor could not resume: {exc}")
 
     async def _confirm_category_b(
         self, tool_name: str, description: str
