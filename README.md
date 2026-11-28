@@ -233,8 +233,11 @@ The dashboard connects to the local ALICE runtime on a background thread. Send m
 - Click **Start voice**, speak, then click **Stop & transcribe**. The transcript is placed in the chat and submitted to ALICE.
 - The OMEN hardware key and configured fallback shortcut activate the same voice capture flow.
 - Wake phrase detection is optional and can be disabled in Settings. It uses the local Faster-Whisper `tiny.en` model to recognize the configured phrase (default: `alice`). This consumes more CPU than a purpose-trained wake-word model.
-- On first use, Faster-Whisper downloads its model into `%ALICE_HOME%\\voice\\models` (default `D:\\Alice\\voice\\models`). After the model is cached, speech recognition runs locally. Captured audio is kept in memory and is not saved to a recording file.
-- Speech output uses a locally installed Piper ONNX voice when one is found in the ALICE voice-model folders; otherwise it uses the Windows SAPI voice through `pyttsx3`.
+- Faster-Whisper uses the `small` model by default on a fresh configuration (change it in Settings if you prefer faster/lighter recognition). Its model is cached in `%ALICE_HOME%\\voice\\models` (default `D:\\Alice\\voice\\models`); transcription then runs locally.
+- Silero VAD detects speech and separates it from silence before transcription. It is enabled by default and can be toggled in Settings. If its ONNX model or runtime is unavailable, ALICE falls back to Faster-Whisper's built-in VAD.
+- Kokoro is the default neural TTS engine. The Kokoro ONNX model and voice bank are downloaded on first spoken reply (roughly 300 MB total) into `%ALICE_HOME%\\voice\\models`; after that, voice generation runs locally. Select an English (US), English (UK), or Hindi voice in Settings and use **Preview selected voice** to listen.
+- Piper is the fallback when a matching `.onnx` voice model and `.onnx.json` metadata file are installed in the ALICE voice-model folders. Windows SAPI via `pyttsx3` is the final compatibility fallback.
+- Microphone recordings remain in memory only; ALICE does not save them as audio files.
 
 Microphone access must be permitted in Windows Privacy settings. Disable microphone mute in ALICE Settings before recording. Wake-word monitoring opens the microphone while enabled; turn it off when you do not want continuous phrase monitoring.
 
