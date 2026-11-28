@@ -268,6 +268,7 @@ class Dashboard(QMainWindow):
         self.runtime_worker.state_changed.connect(self.status_label.setText)
         self.runtime_worker.confirmation_requested.connect(self._show_confirmation)
         self.runtime_worker.hotkey_activated.connect(self._activate_voice)
+        self.runtime_worker.wake_word_paused.connect(self._begin_voice_recording)
 
     def _on_runtime_ready(self, connected: bool, detail: str) -> None:
         self.status_label.setText("Connected" if connected else "Offline — LM Studio")
@@ -313,15 +314,12 @@ class Dashboard(QMainWindow):
 
     def _toggle_voice(self) -> None:
         if not self._voice_recording:
-            try:
-                if self.mute_checkbox.isChecked():
-                    raise RuntimeError("Unmute the microphone in Settings before recording.")
-                self.voice_pipeline.start_listening()
-                self._voice_recording = True
-                self.voice_button.setText("■  Stop & transcribe")
-                self.status_label.setText("Listening…")
-            except Exception as exc:
-                self._on_runtime_error(f"Could not start microphone: {exc}")
+            if self.runtime_worker and self.runtime_worker.wake_word_enabled:
+                self.voice_button.setEnabled(False)
+                self.voice_button.setText("Preparing microphone…")
+                self.runtime_worker.pause_wake_word()
+            else:
+                self._begin_voice_recording()
             return
 
         try:
@@ -332,14 +330,35 @@ class Dashboard(QMainWindow):
             self._transcription_worker = TranscriptionWorker(self.voice_pipeline, self)
             self._transcription_worker.completed.connect(self._on_transcription)
             self._transcription_worker.failed.connect(self._on_transcription_error)
-            self._transcription_worker.finished.connect(
-                lambda: self.voice_button.setEnabled(True)
-            )
+            self._transcription_worker.finished.connect(self._on_transcription_finished)
             self._transcription_worker.start()
         except Exception as exc:
             self._voice_recording = False
             self.voice_button.setText("🎙  Start voice")
+            self.voice_button.setEnabled(True)
+            if self.runtime_worker:
+                self.runtime_worker.resume_wake_word()
             self._on_runtime_error(f"Could not stop microphone: {exc}")
+
+    def _begin_voice_recording(self) -> None:
+        self.voice_button.setEnabled(True)
+        try:
+            if self.mute_checkbox.isChecked():
+                raise RuntimeError("Unmute the microphone in Settings before recording.")
+            self.voice_pipeline.start_listening()
+            self._voice_recording = True
+            self.voice_button.setText("■  Stop & transcribe")
+            self.status_label.setText("Listening…")
+        except Exception as exc:
+            self.voice_button.setText("🎙  Start voice")
+            if self.runtime_worker:
+                self.runtime_worker.resume_wake_word()
+            self._on_runtime_error(f"Could not start microphone: {exc}")
+
+    def _on_transcription_finished(self) -> None:
+        self.voice_button.setEnabled(True)
+        if self.runtime_worker:
+            self.runtime_worker.resume_wake_word()
 
     def _on_transcription(self, text: str) -> None:
         self.voice_button.setText("🎙  Start voice")
