@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QLabel, QVBoxLayout,
     QHBoxLayout, QPushButton, QTextEdit, QListWidget, QCheckBox, QGroupBox,
     QFormLayout, QMessageBox, QLineEdit, QGraphicsOpacityEffect, QProgressBar,
-    QSystemTrayIcon, QMenu, QStyle
+    QSystemTrayIcon, QMenu, QStyle, QComboBox, QSpinBox
 )
 from PySide6.QtGui import QAction
 
@@ -156,6 +156,15 @@ class Dashboard(QMainWindow):
             "or bypass Windows security."
         ))
 
+        ai_group = QGroupBox("Local AI Runtime")
+        ai_form = QFormLayout(ai_group)
+        self.ai_url_edit = QLineEdit(str(self.config.ai.base_url))
+        self.model_name_edit = QLineEdit(str(self.config.ai.model_name))
+        self.model_name_edit.setPlaceholderText("LM Studio model key or display name")
+        ai_form.addRow("LM Studio server URL", self.ai_url_edit)
+        ai_form.addRow("Model", self.model_name_edit)
+        settings_layout.addWidget(ai_group)
+
         access_group = QGroupBox("Computer Access Manager")
         access_form = QFormLayout(access_group)
         access_fields = [
@@ -181,6 +190,26 @@ class Dashboard(QMainWindow):
         self.mute_checkbox.setChecked(bool(self.config.voice.mute))
         self.wakeword_checkbox = QCheckBox("Enable wake-word monitoring")
         self.wakeword_checkbox.setChecked(bool(self.config.voice.wake_word_enabled))
+        self.wakeword_edit = QLineEdit(str(self.config.voice.wake_word))
+        self.mic_device_combo = QComboBox()
+        self.mic_device_combo.addItem("System default microphone", None)
+        try:
+            import sounddevice as sd
+            for device_index, device in enumerate(sd.query_devices()):
+                if int(device.get("max_input_channels", 0)) > 0:
+                    self.mic_device_combo.addItem(str(device.get("name", device_index)), device_index)
+        except Exception as exc:
+            logger.info("Could not enumerate microphone devices: %s", exc)
+        configured_device = self.config.voice.microphone_device
+        selected_device = self.mic_device_combo.findData(configured_device)
+        self.mic_device_combo.setCurrentIndex(max(0, selected_device))
+        self.stt_model_combo = QComboBox()
+        self.stt_model_combo.addItems(["tiny", "base", "small", "medium"])
+        stt_index = self.stt_model_combo.findText(str(self.config.voice.stt_model))
+        self.stt_model_combo.setCurrentIndex(stt_index if stt_index >= 0 else 1)
+        self.tts_rate_spin = QSpinBox()
+        self.tts_rate_spin.setRange(80, 260)
+        self.tts_rate_spin.setValue(int(self.config.voice.tts_rate))
         self.wakeword_checkbox.setToolTip(
             "Wake-word monitoring requires a compatible local openWakeWord model. "
             "The OMEN / configured keyboard shortcut can activate manual voice capture."
@@ -188,6 +217,10 @@ class Dashboard(QMainWindow):
         self.shortcut_edit = QLineEdit(str(self.config.omen.fallback_shortcut))
         voice_form.addRow(self.mute_checkbox)
         voice_form.addRow(self.wakeword_checkbox)
+        voice_form.addRow("Wake phrase", self.wakeword_edit)
+        voice_form.addRow("Microphone", self.mic_device_combo)
+        voice_form.addRow("Speech recognition model", self.stt_model_combo)
+        voice_form.addRow("Speech rate", self.tts_rate_spin)
         voice_form.addRow("Voice activation shortcut", self.shortcut_edit)
         settings_layout.addWidget(voice_group)
 
@@ -379,6 +412,14 @@ class Dashboard(QMainWindow):
             self.config.automation.require_confirmation_for_destructive = True
             self.config.voice.mute = self.mute_checkbox.isChecked()
             self.config.voice.wake_word_enabled = self.wakeword_checkbox.isChecked()
+            self.config.voice.wake_word = self.wakeword_edit.text().strip() or "alice"
+            self.config.voice.microphone_device = self.mic_device_combo.currentData()
+            self.config.voice.stt_model = self.stt_model_combo.currentText()
+            self.config.voice.tts_rate = self.tts_rate_spin.value()
+            self.config.ai.base_url = self.ai_url_edit.text().strip().rstrip("/")
+            self.config.ai.model_name = self.model_name_edit.text().strip()
+            if not self.config.ai.base_url or not self.config.ai.model_name:
+                raise ValueError("LM Studio URL and model name cannot be empty.")
             self.config.startup.start_with_windows = self.startup_checkbox.isChecked()
             self.config.startup.minimize_to_tray = self.tray_checkbox.isChecked()
             from alice.core.startup import set_startup_enabled
