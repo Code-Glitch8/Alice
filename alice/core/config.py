@@ -46,13 +46,17 @@ class VoiceConfig:
     wake_word: str = "alice"
     wake_word_enabled: bool = True
     stt_engine: str = "faster-whisper"
-    stt_model: str = "base"
-    tts_engine: str = "piper"
-    tts_voice: str = "default"
+    stt_model: str = "small"
+    tts_engine: str = "kokoro"
+    tts_voice: str = "af_heart"
+    tts_language: str = "en-us"
+    tts_model_path: str = ""
     tts_rate: int = 150
     microphone_device: Optional[int] = None
     mute: bool = False
     voice_activity_detection: bool = True
+    vad_threshold: float = 0.5
+    vad_min_silence_ms: int = 220
 
 
 def get_windows_known_folder_path(folder_id: str) -> Optional[Path]:
@@ -242,6 +246,7 @@ class StartupConfig:
     start_minimized: bool = True
     open_dashboard: bool = False
     background_service: bool = True
+    minimize_to_tray: bool = False
 
 
 @dataclass
@@ -311,6 +316,14 @@ class Config:
                 for key, value in section_data.items():
                     if hasattr(target, key):
                         setattr(target, key, value)
+        voice_data = data.get("voice")
+        if isinstance(voice_data, dict):
+            # Migrate the previous Piper/SAPI defaults to the new Kokoro-first
+            # stack without replacing a deliberately selected Piper voice.
+            if str(getattr(config.voice, "tts_engine", "kokoro")).lower() == "piper":
+                config.voice.tts_engine = "kokoro"
+            if str(getattr(config.voice, "tts_voice", "")).strip().lower() in {"", "default"}:
+                config.voice.tts_voice = "af_heart"
         if isinstance(data.get("data_dir"), str) and data["data_dir"].strip():
             config.data_dir = data["data_dir"]
         return config

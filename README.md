@@ -217,3 +217,50 @@ The LM Studio adapter tests use a local fake HTTP server. They verify API reques
 - Category C actions are restricted by default.
 - Emergency stop: move mouse to top-left corner (0,0) to trigger pyautogui failsafe.
 - All automation stays local - no cloud dependencies.
+
+## Windows Desktop Application
+
+The main Windows app starts the PySide6 dashboard, not the diagnostic CLI:
+
+```powershell
+python -m alice.main
+```
+
+The dashboard connects to the local ALICE runtime on a background thread. Send messages from the Chat tab; approved tool calls are executed through the existing planner and tool registry. Destructive file operations and Category B actions display an explicit approval dialog.
+
+### Voice controls
+
+- Click **Start voice**, speak, then click **Stop & transcribe**. The transcript is placed in the chat and submitted to ALICE.
+- The OMEN hardware key and configured fallback shortcut activate the same voice capture flow.
+- Wake phrase detection is optional and can be disabled in Settings. It uses the local Faster-Whisper `tiny.en` model to recognize the configured phrase (default: `alice`). This consumes more CPU than a purpose-trained wake-word model.
+- Faster-Whisper uses the `small` model by default on a fresh configuration (change it in Settings if you prefer faster/lighter recognition). Its model is cached in `%ALICE_HOME%\\voice\\models` (default `D:\\Alice\\voice\\models`); transcription then runs locally.
+- Silero VAD detects speech and separates it from silence before transcription. It is enabled by default and can be toggled in Settings. If its ONNX model or runtime is unavailable, ALICE falls back to Faster-Whisper's built-in VAD.
+- Kokoro is the default neural TTS engine. The Kokoro ONNX model and voice bank are downloaded on first spoken reply (roughly 300 MB total) into `%ALICE_HOME%\\voice\\models`; after that, voice generation runs locally. Select an English (US), English (UK), or Hindi voice in Settings and use **Preview selected voice** to listen.
+- Piper is the fallback when a matching `.onnx` voice model and `.onnx.json` metadata file are installed in the ALICE voice-model folders. Windows SAPI via `pyttsx3` is the final compatibility fallback.
+- Microphone recordings remain in memory only; ALICE does not save them as audio files.
+
+Microphone access must be permitted in Windows Privacy settings. Disable microphone mute in ALICE Settings before recording. Wake-word monitoring opens the microphone while enabled; turn it off when you do not want continuous phrase monitoring.
+
+### Startup and system tray
+
+In Settings, users may opt in to **Start ALICE when I sign in** (per-user Windows Run key) and **Keep ALICE running in the system tray** when the window is closed. Both options are off unless selected. The tray menu can reopen ALICE, start voice capture, or exit the application.
+
+### Build and download
+
+The Windows GitHub Actions workflow runs the automated tests on Python 3.11 and 3.12, then builds the desktop GUI and creates:
+
+- `ALICE-Windows-Installer` — `ALICE-Setup.exe` Inno Setup installer.
+- `ALICE-Windows-Portable` — portable folder packaged as a ZIP.
+
+Open the repository's **Actions** tab, select the latest successful **ALICE Windows Desktop Build** run, and download the corresponding artifact. The installer creates a Start Menu shortcut and supports normal uninstalling.
+
+The CI build verifies the Python modules, automated tests, PyInstaller output, installer output, and artifact upload. It does not prove microphone hardware, OMEN-key events, a real LM Studio model, or live desktop automation work on every target computer; those require a first-run check on the Windows laptop.
+
+### CLI diagnostics remain available
+
+For diagnostics or terminal-only chat, use:
+
+```powershell
+python -m alice.cli --check-ai
+python -m alice.cli --chat
+```

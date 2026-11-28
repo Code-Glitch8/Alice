@@ -1,22 +1,40 @@
 # ALICE PyInstaller spec file
 # Run with: pyinstaller alice.spec
 
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
+
 block_cipher = None
 
+# Bundle the ONNX runtimes and phonemizer resources required by Kokoro.
+extra_datas, extra_binaries, extra_hiddenimports = [], [], []
+for package in ("kokoro_onnx", "onnxruntime", "phonemizer", "espeakng_loader"):
+    package_datas, package_binaries, package_hiddenimports = collect_all(package)
+    extra_datas += package_datas
+    extra_binaries += package_binaries
+    extra_hiddenimports += package_hiddenimports
+
+vad_model = Path("build-assets/voice_models/silero_vad.onnx")
+vad_datas = [(str(vad_model), "voice_models")] if vad_model.is_file() else []
+
 a = Analysis(
-    ['alice/cli.py'],
+    ['alice/main.py'],
     pathex=[],
-    binaries=[],
+    binaries=extra_binaries,
     datas=[
         ('alice', 'alice'),
         ('README.md', '.'),
         ('requirements.txt', '.'),
-    ],
+    ] + extra_datas + vad_datas,
     hiddenimports=[
         'PySide6.QtCore',
         'PySide6.QtWidgets',
         'PySide6.QtGui',
         'faster_whisper',
+        'kokoro_onnx',
+        'onnxruntime',
+        'phonemizer.backend.espeak.wrapper',
+        'espeakng_loader',
         'piper_tts',
         'openwakeword',
         'sounddevice',
@@ -34,7 +52,7 @@ a = Analysis(
         'aiohttp',
         'requests',
         'tqdm',
-    ],
+    ] + extra_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

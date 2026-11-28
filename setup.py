@@ -37,6 +37,9 @@ setup(
         "console_scripts": [
             "alice=alice.cli:main",
         ],
+        "gui_scripts": [
+            "alice-desktop=alice.main:main",
+        ],
     },
     include_package_data=True,
     package_data={
