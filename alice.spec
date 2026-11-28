@@ -4,7 +4,7 @@
 block_cipher = None
 
 a = Analysis(
-    ['alice/cli.py'],
+    ['alice/main.py'],
     pathex=[],
     binaries=[],
     datas=[
