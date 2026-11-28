@@ -72,6 +72,11 @@ class WakeWordDetector:
             raise RuntimeError(self.last_error) from exc
 
         self._stop_event.clear()
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
         self.last_error = None
         self.listening = True
         self._thread = threading.Thread(
@@ -88,12 +93,18 @@ class WakeWordDetector:
         self.listening = False
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=4)
+            thread.join(timeout=15)
+            if thread.is_alive():
+                self.last_error = "Wake-word microphone did not stop in time."
+                return False
         self._thread = None
         return True
 
     async def stop_async(self) -> bool:
-        return await asyncio.to_thread(self.stop)
+        stopped = await asyncio.to_thread(self.stop)
+        if not stopped:
+            raise RuntimeError(self.last_error or "Could not release wake-word microphone.")
+        return True
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         if status:
