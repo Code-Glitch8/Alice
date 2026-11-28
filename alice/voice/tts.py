@@ -104,11 +104,29 @@ class PiperTTS:
             raise RuntimeError(
                 "No Piper voice model is installed and pyttsx3 is unavailable."
             ) from exc
-        if self._sapi_engine is None:
-            self._sapi_engine = pyttsx3.init()
-            self._sapi_engine.setProperty("rate", self.rate)
-        self._sapi_engine.say(text)
-        self._sapi_engine.runAndWait()
+
+        pythoncom = None
+        engine = None
+        try:
+            if os.name == "nt":
+                import pythoncom as _pythoncom
+                pythoncom = _pythoncom
+                pythoncom.CoInitialize()
+            # Create and dispose the engine on the same worker thread. SAPI is COM-based.
+            engine = pyttsx3.init()
+            self._sapi_engine = engine
+            engine.setProperty("rate", self.rate)
+            engine.say(text)
+            engine.runAndWait()
+        finally:
+            if engine is not None:
+                try:
+                    engine.stop()
+                except Exception:
+                    logger.debug("Could not dispose SAPI engine", exc_info=True)
+            self._sapi_engine = None
+            if pythoncom is not None:
+                pythoncom.CoUninitialize()
 
     def stop(self) -> None:
         try:
