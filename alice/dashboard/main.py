@@ -356,9 +356,14 @@ class Dashboard(QMainWindow):
         self.config.voice.tts_language = str(self.tts_language_combo.currentData() or "en-us")
         self.config.voice.tts_voice = str(self.tts_voice_combo.currentData() or "af_heart")
         self.config.voice.tts_rate = self.tts_rate_spin.value()
+        preview_text = (
+            "नमस्ते। मैं ALICE हूँ। यह चुनी हुई आवाज़ का परीक्षण है।"
+            if self.config.voice.tts_language == "hi"
+            else "Hello. I am ALICE. This is a preview of the selected neural voice."
+        )
         threading.Thread(
             target=self.voice_pipeline.speak,
-            args=("Hello. I am ALICE. This is a preview of the selected neural voice.",),
+            args=(preview_text,),
             name="ALICE-VoicePreview",
             daemon=True,
         ).start()
