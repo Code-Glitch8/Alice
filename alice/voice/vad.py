@@ -119,7 +119,7 @@ class SileroVAD:
         threshold: float = 0.5,
         min_silence_ms: int = 220,
         min_speech_ms: int = 250,
-        padding_ms: int = 180,
+        padding_ms: int = 80,
     ) -> list[tuple[int, int]]:
         """Convert 32 ms speech probabilities into padded sample intervals."""
         probs = list(probabilities)
@@ -166,7 +166,7 @@ class SileroVAD:
             end = min(audio_length, end + padding)
             if end - start < min_speech_samples:
                 continue
-            if padded and start - padded[-1][1] <= int(0.18 * cls.SAMPLE_RATE):
+            if padded and start - padded[-1][1] <= int(0.04 * cls.SAMPLE_RATE):
                 padded[-1] = (padded[-1][0], max(padded[-1][1], end))
             else:
                 padded.append((start, end))
